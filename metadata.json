@@ -1,0 +1,6 @@
+{
+  "name": "Telegram to Google Drive Bot",
+  "description": "بوت تليجرام لتحويل واستقبال الملفات ورفعها مباشرة إلى Google Drive مع لوحة تحكم ومتابعة فورية للملفات.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
