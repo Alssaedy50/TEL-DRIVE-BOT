@@ -2,6 +2,8 @@ import { initializeApp } from 'firebase/app';
 import {
   getAuth,
   signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
   GoogleAuthProvider,
   onAuthStateChanged,
   User,
@@ -15,6 +17,10 @@ export const SCOPES = [
   'https://www.googleapis.com/auth/drive.file',
 ];
 
+const TOKEN_STORAGE_KEY = 'tg_drive_oauth_token';
+const TOKEN_EXPIRY_KEY = 'tg_drive_oauth_expiry';
+const TOKEN_TTL_MS = 52 * 60 * 1000; // 52 minutes
+
 const provider = new GoogleAuthProvider();
 for (const scope of SCOPES) {
   provider.addScope(scope);
@@ -23,25 +29,67 @@ provider.setCustomParameters({
   prompt: 'select_account consent',
 });
 
-// Flag to indicate if we are in the middle of a sign-in flow.
 let isSigningIn = false;
-// Cache the access token strictly in memory.
-let cachedAccessToken: string | null = null;
+let cachedAccessToken: string | null = loadStoredToken();
+
+function loadStoredToken(): string | null {
+  try {
+    const token = localStorage.getItem(TOKEN_STORAGE_KEY);
+    const expiry = Number(localStorage.getItem(TOKEN_EXPIRY_KEY) || '0');
+    if (token && expiry > Date.now()) {
+      return token;
+    }
+    localStorage.removeItem(TOKEN_STORAGE_KEY);
+    localStorage.removeItem(TOKEN_EXPIRY_KEY);
+  } catch {
+    // Ignore storage errors
+  }
+  return null;
+}
+
+export function saveStoredToken(token: string) {
+  cachedAccessToken = token;
+  try {
+    localStorage.setItem(TOKEN_STORAGE_KEY, token);
+    localStorage.setItem(TOKEN_EXPIRY_KEY, String(Date.now() + TOKEN_TTL_MS));
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+export function clearStoredToken() {
+  cachedAccessToken = null;
+  try {
+    localStorage.removeItem(TOKEN_STORAGE_KEY);
+    localStorage.removeItem(TOKEN_EXPIRY_KEY);
+  } catch {
+    // Ignore
+  }
+}
 
 export const initAuth = (
   onAuthSuccess?: (user: User, token: string) => void,
   onAuthFailure?: () => void
 ) => {
-  return onAuthStateChanged(auth, async (user: User | null) => {
-    if (user) {
-      if (cachedAccessToken) {
-        if (onAuthSuccess) onAuthSuccess(user, cachedAccessToken);
-      } else if (!isSigningIn) {
-        cachedAccessToken = null;
-        if (onAuthFailure) onAuthFailure();
+  // Check if returning from a mobile redirect sign-in
+  getRedirectResult(auth)
+    .then((result) => {
+      if (result) {
+        const credential = GoogleAuthProvider.credentialFromResult(result);
+        if (credential?.accessToken) {
+          saveStoredToken(credential.accessToken);
+          if (onAuthSuccess) onAuthSuccess(result.user, credential.accessToken);
+        }
       }
-    } else {
-      cachedAccessToken = null;
+    })
+    .catch(() => {});
+
+  return onAuthStateChanged(auth, async (user: User | null) => {
+    const activeToken = cachedAccessToken || loadStoredToken();
+    if (user && activeToken) {
+      cachedAccessToken = activeToken;
+      if (onAuthSuccess) onAuthSuccess(user, activeToken);
+    } else if (!isSigningIn) {
       if (onAuthFailure) onAuthFailure();
     }
   });
@@ -56,9 +104,13 @@ export const googleSignIn = async (): Promise<{ user: User; accessToken: string 
       throw new Error('تعذر الحصول على رمز الوصول (Access Token) من حساب Google.');
     }
 
-    cachedAccessToken = credential.accessToken;
-    return { user: result.user, accessToken: cachedAccessToken };
-  } catch (error: unknown) {
+    saveStoredToken(credential.accessToken);
+    return { user: result.user, accessToken: credential.accessToken };
+  } catch (error: any) {
+    if (error?.code === 'auth/popup-blocked') {
+      await signInWithRedirect(auth, provider);
+      return null;
+    }
     console.error('Sign in error:', error);
     throw error;
   } finally {
@@ -67,10 +119,10 @@ export const googleSignIn = async (): Promise<{ user: User; accessToken: string 
 };
 
 export const getAccessToken = async (): Promise<string | null> => {
-  return cachedAccessToken;
+  return cachedAccessToken || loadStoredToken();
 };
 
 export const logout = async () => {
+  clearStoredToken();
   await auth.signOut();
-  cachedAccessToken = null;
 };

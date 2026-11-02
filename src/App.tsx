@@ -19,7 +19,6 @@ import {
   Activity,
   FolderCheck,
   Loader2,
-  Zap,
   X,
   Link2,
   Ban,
@@ -43,7 +42,13 @@ import {
   type DriveFolder,
 } from './services/googleDrive';
 import firebaseConfig from '../firebase-applet-config.json';
-import { googleSignIn, initAuth, logout as firebaseLogout } from './firebase';
+import {
+  googleSignIn,
+  initAuth,
+  logout as firebaseLogout,
+  saveStoredToken,
+  clearStoredToken,
+} from './firebase';
 
 declare global {
   interface Window {
@@ -55,6 +60,7 @@ const SCOPES = 'https://www.googleapis.com/auth/drive.file';
 const STORAGE_EMAIL_KEY = 'tg_drive_personal_email';
 const STORAGE_NAME_KEY = 'tg_drive_personal_name';
 const STORAGE_CHAT_ID_KEY = 'tg_drive_personal_chat_id';
+const STORAGE_CUSTOM_CLIENT_ID_KEY = 'tg_drive_custom_google_client_id';
 
 type CompressMode = 'none' | 'zip' | 'media';
 type ModalType = 'drive_files' | 'large_upload' | 'settings' | 'admin' | 'url_options' | null;
@@ -188,6 +194,13 @@ export default function App() {
     return localStorage.getItem(STORAGE_CHAT_ID_KEY) || '';
   });
 
+  // Custom Google Client ID support (for Vercel deployments)
+  const [customClientId, setCustomClientId] = useState<string>(() => {
+    return localStorage.getItem(STORAGE_CUSTOM_CLIENT_ID_KEY) || '';
+  });
+  const [unauthorizedDomainHost, setUnauthorizedDomainHost] = useState<string | null>(null);
+  const [copiedDomain, setCopiedDomain] = useState(false);
+
   // Google OAuth state
   const [accessToken, setAccessToken] = useState<string | null>(null);
   const [userProfile, setUserProfile] = useState<{ name: string; email: string; picture?: string } | null>(null);
@@ -238,6 +251,7 @@ export default function App() {
   const [bannerSuccess, setBannerSuccess] = useState<string | null>(null);
 
   const clientId =
+    customClientId.trim() ||
     (import.meta as any).env?.VITE_GOOGLE_CLIENT_ID ||
     (firebaseConfig as any)?.oAuthClientId ||
     '';
@@ -296,7 +310,7 @@ export default function App() {
 
   useEffect(() => {
     fetchStatus();
-    const interval = setInterval(fetchStatus, 1500);
+    const interval = setInterval(fetchStatus, 1800);
     return () => clearInterval(interval);
   }, [fetchStatus]);
 
@@ -305,6 +319,7 @@ export default function App() {
     const unsubscribe = initAuth(
       (user, token) => {
         setAccessToken(token);
+        setUnauthorizedDomainHost(null);
         onGoogleAuthenticated(token, {
           name: user.displayName || undefined,
           email: user.email || undefined,
@@ -326,7 +341,9 @@ export default function App() {
               return;
             }
             const token = tokenResponse.access_token;
+            saveStoredToken(token);
             setAccessToken(token);
+            setUnauthorizedDomainHost(null);
             setBannerError(null);
             await onGoogleAuthenticated(token);
           },
@@ -446,6 +463,7 @@ export default function App() {
 
   const handleSignIn = async () => {
     setBannerError(null);
+    setUnauthorizedDomainHost(null);
     try {
       const result = await googleSignIn();
       if (result) {
@@ -462,6 +480,15 @@ export default function App() {
         tokenClientRef.current.requestAccessToken({ prompt: 'select_account' });
         return;
       }
+      if (err?.code === 'auth/unauthorized-domain') {
+        const currentHost = window.location.hostname;
+        setUnauthorizedDomainHost(currentHost);
+        setActiveModal('settings');
+        setBannerError(
+          `النطاق (${currentHost}) غير مضاف بعد في قائمة النطاقات المصرح بها في Firebase. راجع الخطوة الموضحة في نافذة الإعدادات.`
+        );
+        return;
+      }
       if (err?.code !== 'auth/popup-closed-by-user') {
         setBannerError(err?.message || 'تعذر تسجيل الدخول بحساب Google.');
       }
@@ -474,6 +501,7 @@ export default function App() {
     } catch {
       // Ignore
     }
+    clearStoredToken();
     if (accessToken && window.google?.accounts?.oauth2) {
       window.google.accounts.oauth2.revoke(accessToken, () => {});
     }
@@ -490,6 +518,7 @@ export default function App() {
   };
 
   const handleClearPersonalSession = () => {
+    clearStoredToken();
     localStorage.removeItem(STORAGE_EMAIL_KEY);
     localStorage.removeItem(STORAGE_NAME_KEY);
     localStorage.removeItem(STORAGE_CHAT_ID_KEY);
@@ -877,68 +906,66 @@ export default function App() {
 
   return (
     <div dir="rtl" className="min-h-screen bg-[#090D16] text-slate-100 font-sans flex flex-col">
-      {/* Single Clean Top Bar — All Secondary Menus Open in Popup Modals */}
-      <header className="px-4 sm:px-6 py-3.5 border-b border-slate-800/80 bg-[#0D1322]/95 backdrop-blur-md sticky top-0 z-30">
-        <div className="max-w-5xl mx-auto flex items-center justify-between gap-4">
+      {/* Single Clean Top Bar — Fits 100% on Mobile & Desktop Without Truncation or Disappearing Links */}
+      <header className="px-3 sm:px-6 py-3 border-b border-slate-800/80 bg-[#0D1322]/95 backdrop-blur-md sticky top-0 z-30">
+        <div className="max-w-5xl mx-auto flex items-center justify-between gap-2 sm:gap-6">
           {/* Zone 1: Brand Title */}
-          <div className="flex items-center gap-2.5 shrink-0">
-            <div className="w-8 h-8 rounded-lg bg-sky-500/15 border border-sky-500/30 flex items-center justify-center text-sky-400">
-              <Send className="w-4 h-4" />
+          <div className="flex items-center gap-2 shrink-0">
+            <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-sky-500/15 border border-sky-500/30 flex items-center justify-center text-sky-400">
+              <Send className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
             </div>
-            <span className="text-base font-bold text-white tracking-tight whitespace-nowrap">
-              TeleDrive Cloud
+            <span className="text-sm sm:text-base font-bold text-white tracking-tight whitespace-nowrap">
+              TeleDrive
             </span>
           </div>
 
-          {/* Zone 2: Popup Menu Triggers (Single-Line Controls) */}
-          <nav className="flex items-center gap-1.5 sm:gap-2 overflow-x-auto no-scrollbar">
+          {/* Zone 2: Popup Menu Links (Always Visible on Mobile & Desktop) */}
+          <nav className="flex items-center gap-1 sm:gap-2">
             <button
               onClick={() => {
                 setActiveModal('drive_files');
                 if (accessToken) refreshDriveFoldersAndFiles();
               }}
-              className="px-2.5 sm:px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-200 text-xs font-medium flex items-center gap-1.5 transition cursor-pointer whitespace-nowrap shrink-0"
+              className="px-2 sm:px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-200 text-xs font-medium flex items-center gap-1.5 transition cursor-pointer whitespace-nowrap shrink-0"
             >
-              <HardDrive className="w-3.5 h-3.5 text-sky-400" />
-              <span>ملفات ومجلدات Drive</span>
+              <HardDrive className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+              <span>ملفاتي</span>
             </button>
 
             <button
               onClick={() => setActiveModal('large_upload')}
-              className="px-2.5 sm:px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-200 text-xs font-medium flex items-center gap-1.5 transition cursor-pointer whitespace-nowrap shrink-0"
+              className="px-2 sm:px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-200 text-xs font-medium flex items-center gap-1.5 transition cursor-pointer whitespace-nowrap shrink-0"
             >
-              <UploadCloud className="w-3.5 h-3.5 text-indigo-400" />
+              <UploadCloud className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
               <span>رفع ضخم</span>
             </button>
 
             <button
               onClick={() => setActiveModal('admin')}
-              className="px-2.5 sm:px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-200 text-xs font-medium flex items-center gap-1.5 transition cursor-pointer whitespace-nowrap shrink-0"
+              className="px-2 sm:px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-200 text-xs font-medium flex items-center gap-1.5 transition cursor-pointer whitespace-nowrap shrink-0"
             >
-              <ShieldAlert className="w-3.5 h-3.5 text-amber-400" />
-              <span>الإدارة و Vercel</span>
+              <ShieldAlert className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+              <span>الإدارة</span>
             </button>
           </nav>
 
           {/* Zone 3: Single Unified Account & Settings Popup Trigger */}
           <button
             onClick={() => setActiveModal('settings')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer whitespace-nowrap shrink-0 ${
+            className={`px-2.5 sm:px-3.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer whitespace-nowrap shrink-0 ${
               driveConnected
                 ? 'bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30'
                 : 'bg-sky-600 hover:bg-sky-500 text-white'
             }`}
           >
-            <User className="w-3.5 h-3.5" />
-            <span className="max-w-[110px] sm:max-w-[160px] truncate">
-              {driveConnected ? effectiveUserName || effectiveUserEmail || 'حسابي متصل' : 'ربط الحساب والإعدادات'}
-            </span>
+            <User className="w-3.5 h-3.5 shrink-0" />
+            <span>{driveConnected ? 'حسابي متصل' : 'ربط الحساب'}</span>
           </button>
         </div>
       </header>
 
       {/* Main Focused Workspace */}
-      <main className="flex-1 max-w-5xl w-full mx-auto px-4 sm:px-6 py-5 space-y-5">
+      <main className="flex-1 max-w-5xl w-full mx-auto px-3.5 sm:px-6 py-4 sm:py-6 space-y-4 sm:space-y-5">
         {/* Notification Banners */}
         {bannerError && (
           <div className="p-3.5 rounded-xl bg-rose-950/70 border border-rose-500/40 text-rose-200 flex items-center justify-between gap-3">
@@ -964,15 +991,20 @@ export default function App() {
           </div>
         )}
 
-        {/* Quiet 1-Line Status Summary Bar (No Duplicate Action Buttons) */}
-        <div className="px-4 py-2.5 rounded-xl bg-[#0D1322] border border-slate-800/80 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className={driveConnected ? 'text-emerald-300 font-medium' : 'text-amber-300 font-medium'}>
-              {driveConnected ? `حسابك: ${effectiveUserEmail || effectiveUserName}` : 'لم يتم ربط Google Drive بعد'}
+        {/* Interactive Status Bar (Opens Settings or Drive Folder Popup When Clicked) */}
+        <div
+          onClick={() => setActiveModal('settings')}
+          className="px-4 py-3 rounded-xl bg-[#0D1322] hover:bg-slate-900/90 border border-slate-800/90 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400 cursor-pointer transition"
+        >
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span className={driveConnected ? 'text-emerald-300 font-semibold' : 'text-amber-300 font-semibold'}>
+              {driveConnected
+                ? `Google Drive: ${effectiveUserEmail || effectiveUserName}`
+                : 'اضغط هنا لربط Google Drive وتليجرام'}
             </span>
             <span aria-hidden="true">·</span>
             <span>
-              المجلد النشط: <strong className="text-slate-200">{serverStatus?.drive.activeFolderName || selectedFolderName}</strong>
+              المجلد: <strong className="text-slate-200">{serverStatus?.drive.activeFolderName || selectedFolderName}</strong>
             </span>
             <span aria-hidden="true">·</span>
             <span>
@@ -980,7 +1012,7 @@ export default function App() {
             </span>
           </div>
 
-          <div className="flex items-center gap-2 tabular-nums">
+          <div className="flex items-center gap-2 tabular-nums text-slate-300">
             <span>المكتملة: {serverStatus?.stats.completedJobs ?? 0}</span>
             <span aria-hidden="true">·</span>
             <span>الجارية: {serverStatus?.stats.activeJobs ?? 0}</span>
@@ -990,8 +1022,8 @@ export default function App() {
         </div>
 
         {/* Core Card 1: Multi-Platform URL & Video Puller */}
-        <section className="bg-[#0D1322] border border-slate-800/90 rounded-2xl p-5 sm:p-6 space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-3">
+        <section className="bg-[#0D1322] border border-slate-800/90 rounded-2xl p-4 sm:p-6 space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
               <h1 className="text-base sm:text-lg font-bold text-white">
                 سحب وتحميل الفيديوهات والملفات عبر الروابط
@@ -1005,9 +1037,9 @@ export default function App() {
             <button
               type="button"
               onClick={() => setActiveModal('url_options')}
-              className="px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700/80 text-slate-200 text-xs font-medium flex items-center gap-2 transition cursor-pointer whitespace-nowrap shrink-0"
+              className="self-start sm:self-auto px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700/80 text-slate-200 text-xs font-medium flex items-center gap-2 transition cursor-pointer whitespace-nowrap shrink-0"
             >
-              <Sliders className="w-3.5 h-3.5 text-sky-400" />
+              <Sliders className="w-3.5 h-3.5 text-sky-400 shrink-0" />
               <span>
                 خيارات السحب: {externalMediaFormat === 'audio' ? `MP3 (${externalQuality}k)` : `MP4 (${externalQuality}p)`} · {compressLabel}
               </span>
@@ -1015,43 +1047,43 @@ export default function App() {
           </div>
 
           <form onSubmit={handleUrlUploadSubmit} className="space-y-3.5">
-            {/* Destination Segmented Control */}
-            <div className="grid grid-cols-3 gap-2 p-1 rounded-xl bg-slate-950 border border-slate-800/80">
+            {/* Destination Segmented Control — Concise Labels that Never Truncate on Mobile */}
+            <div className="grid grid-cols-3 gap-1.5 p-1 rounded-xl bg-slate-950 border border-slate-800/80">
               <button
                 type="button"
                 onClick={() => setExternalDestination('drive')}
-                className={`py-2 px-2.5 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer whitespace-nowrap ${
+                className={`py-2 px-2 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer whitespace-nowrap ${
                   externalDestination === 'drive'
                     ? 'bg-emerald-600 text-white shadow-sm'
                     : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
                 <HardDrive className="w-3.5 h-3.5 shrink-0" />
-                <span className="truncate">إلى Google Drive</span>
+                <span>إلى Drive</span>
               </button>
               <button
                 type="button"
                 onClick={() => setExternalDestination('telegram')}
-                className={`py-2 px-2.5 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer whitespace-nowrap ${
+                className={`py-2 px-2 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer whitespace-nowrap ${
                   externalDestination === 'telegram'
                     ? 'bg-sky-600 text-white shadow-sm'
                     : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
                 <Smartphone className="w-3.5 h-3.5 shrink-0" />
-                <span className="truncate">إلى تليجرام</span>
+                <span>إلى تليجرام</span>
               </button>
               <button
                 type="button"
                 onClick={() => setExternalDestination('device')}
-                className={`py-2 px-2.5 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer whitespace-nowrap ${
+                className={`py-2 px-2 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer whitespace-nowrap ${
                   externalDestination === 'device'
                     ? 'bg-indigo-600 text-white shadow-sm'
                     : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
                 <Download className="w-3.5 h-3.5 shrink-0" />
-                <span className="truncate">تحميل لجهازي</span>
+                <span>لجهازي</span>
               </button>
             </div>
 
@@ -1087,7 +1119,7 @@ export default function App() {
         </section>
 
         {/* Core Card 2: Live Personal Transfer Queue & History */}
-        <section className="bg-[#0D1322] border border-slate-800/90 rounded-2xl p-5 sm:p-6 space-y-4">
+        <section className="bg-[#0D1322] border border-slate-800/90 rounded-2xl p-4 sm:p-6 space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800/80 pb-3.5">
             <div className="flex items-center gap-2">
               <Activity className="w-4 h-4 text-sky-400" />
@@ -1122,7 +1154,7 @@ export default function App() {
             <div className="py-10 text-center border border-dashed border-slate-800 rounded-xl space-y-1.5">
               <p className="text-sm text-slate-300 font-medium">لا توجد عمليات نقل حالياً</p>
               <p className="text-xs text-slate-500">
-                أدمج أي رابط في الأعلى أو أرسل ملفاً لبوت تليجرام لتظهر حالة النقل والسرعة هنا.
+                ضع أي رابط في الأعلى أو أرسل ملفاً لبوت تليجرام لتظهر حالة النقل والسرعة هنا.
               </p>
             </div>
           ) : (
@@ -1667,6 +1699,32 @@ export default function App() {
               {/* MODAL 4: PERSONAL ACCOUNT & SETTINGS */}
               {activeModal === 'settings' && (
                 <div className="space-y-5">
+                  {unauthorizedDomainHost && (
+                    <div className="p-4 rounded-xl bg-amber-950/60 border border-amber-500/40 space-y-2.5 text-xs">
+                      <p className="font-bold text-amber-200">
+                        لتفعيل نافذة تسجيل الدخول بـ Google على دومين Vercel الجديد ({unauthorizedDomainHost}):
+                      </p>
+                      <p className="text-amber-100/90 leading-relaxed">
+                        انسخ النطاق أدناه وأضفه في لوحة تحكم Firebase (Authentication → Settings → Authorized domains) ليعمل الدخول بضغطة زر على هذا النطاق:
+                      </p>
+                      <div className="flex items-center justify-between gap-2 p-2 rounded-lg bg-slate-950 border border-amber-500/30">
+                        <code className="text-amber-300 font-mono" dir="ltr">
+                          {unauthorizedDomainHost}
+                        </code>
+                        <button
+                          onClick={() => {
+                            navigator.clipboard.writeText(unauthorizedDomainHost);
+                            setCopiedDomain(true);
+                            setTimeout(() => setCopiedDomain(false), 2000);
+                          }}
+                          className="px-2.5 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 font-semibold cursor-pointer"
+                        >
+                          {copiedDomain ? 'تم النسخ' : 'نسخ النطاق'}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     {/* Google Drive Account Box */}
                     <div className="p-4 rounded-xl bg-slate-900/70 border border-slate-800 space-y-3">
@@ -1810,6 +1868,26 @@ export default function App() {
                         <option value="360">360p</option>
                         <option value="240">240p</option>
                       </select>
+                    </div>
+                  </div>
+
+                  {/* Optional Custom Google Client ID for Vercel */}
+                  <div className="p-3.5 rounded-xl bg-slate-900/40 border border-slate-800/80 space-y-2">
+                    <label className="block text-xs font-semibold text-slate-300">
+                      معرف عميل Google OAuth مخصص لـ Vercel (اختياري - Client ID)
+                    </label>
+                    <div className="flex flex-col sm:flex-row gap-2">
+                      <input
+                        type="text"
+                        dir="ltr"
+                        value={customClientId}
+                        onChange={(e) => {
+                          setCustomClientId(e.target.value);
+                          localStorage.setItem(STORAGE_CUSTOM_CLIENT_ID_KEY, e.target.value.trim());
+                        }}
+                        placeholder="xxxx.apps.googleusercontent.com (اتركه فارغاً للافتراضي)"
+                        className="flex-1 px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-white placeholder-slate-500"
+                      />
                     </div>
                   </div>
 

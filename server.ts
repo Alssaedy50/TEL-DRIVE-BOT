@@ -4336,9 +4336,11 @@ async function handleCallbackQuery(callbackQuery: any): Promise<void> {
     saveStateToDisk();
 
     if (isToTg) {
-      executePullToTelegramJob(job);
+      if (IS_VERCEL) await executePullToTelegramJob(job);
+      else executePullToTelegramJob(job);
     } else if (userSess.accessToken && userSess.accountEnabled) {
-      executeTransferJob(job);
+      if (IS_VERCEL) await executeTransferJob(job);
+      else executeTransferJob(job);
     }
     return;
   }
@@ -5032,7 +5034,8 @@ async function handleTelegramUpdate(update: any): Promise<void> {
 
     transferJobs.unshift(job);
     saveStateToDisk();
-    executePullToTelegramJob(job);
+    if (IS_VERCEL) await executePullToTelegramJob(job);
+    else executePullToTelegramJob(job);
     return;
   }
 
@@ -5114,7 +5117,8 @@ async function handleTelegramUpdate(update: any): Promise<void> {
   saveStateToDisk();
 
   if (canUploadNow) {
-    executeTransferJob(job);
+    if (IS_VERCEL) await executeTransferJob(job);
+    else executeTransferJob(job);
   }
 }
 
@@ -5402,8 +5406,15 @@ app.post('/api/bot/webhook', async (req, res) => {
   }
 });
 
-app.get('/api/status', (req, res) => {
+app.get('/api/status', async (req, res) => {
   const hasToken = Boolean(getBotToken());
+  if (hasToken && !botInfo) {
+    try {
+      await startTelegramServices();
+    } catch {
+      // Ignore cold-start error
+    }
+  }
   const hasMtprotoConfig = Boolean(getApiId() && getApiHash());
   const ctx = resolveRequestUserContext(req);
   const { profile, session } = ctx;
@@ -6007,7 +6018,11 @@ app.post('/api/telegram/send-drive-file', async (req, res) => {
 
   transferJobs.unshift(job);
   saveStateToDisk();
-  executePullToTelegramJob(job);
+  if (IS_VERCEL) {
+    await executePullToTelegramJob(job);
+  } else {
+    executePullToTelegramJob(job);
+  }
 
   res.json({ ok: true, job });
 });
@@ -6089,7 +6104,11 @@ app.post('/api/transfers/url', async (req, res) => {
 
     transferJobs.unshift(job);
     saveStateToDisk();
-    executePullToTelegramJob(job);
+    if (IS_VERCEL) {
+      await executePullToTelegramJob(job);
+    } else {
+      executePullToTelegramJob(job);
+    }
     res.json({ ok: true, job });
     return;
   }
@@ -6120,7 +6139,11 @@ app.post('/api/transfers/url', async (req, res) => {
   transferJobs.unshift(job);
   saveStateToDisk();
   if (canUpload) {
-    executeTransferJob(job);
+    if (IS_VERCEL) {
+      await executeTransferJob(job);
+    } else {
+      executeTransferJob(job);
+    }
   }
 
   res.json({ ok: true, job });
