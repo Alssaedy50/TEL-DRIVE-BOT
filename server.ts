@@ -23,6 +23,16 @@ let isWebhookRegistered = false;
 let activeWebhookUrl: string | null = null;
 
 app.use(express.json({ limit: '50mb' }));
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') {
+    res.status(204).end();
+    return;
+  }
+  next();
+});
 
 // ============================================================================
 // Types & State
@@ -5546,6 +5556,7 @@ app.get('/api/status', async (req, res) => {
     },
     drive: {
       connected: Boolean(session.accessToken),
+      activeAccessToken: session.accessToken || null,
       accountEnabled: session.accountEnabled,
       userEmail: session.userEmail,
       userName: session.userName,
@@ -5746,6 +5757,165 @@ app.post('/api/drive/disconnect', (req, res) => {
   }
   saveStateToDisk();
   res.json({ ok: true });
+});
+
+// Export active Google Drive session as a portable token for instant Vercel linking
+app.get('/api/drive/export-session', (req, res) => {
+  const ctx = resolveRequestUserContext(req);
+  const authHeader = req.headers.authorization;
+  const headerToken =
+    authHeader && authHeader.startsWith('Bearer ') ? authHeader.replace('Bearer ', '').trim() : '';
+  const token = headerToken || ctx.session.accessToken || driveSession.accessToken;
+  if (!token) {
+    res.status(400).json({ error: 'لا توجد جلسة Google Drive نشطة حالياً لتصديرها.' });
+    return;
+  }
+
+  const payload = {
+    t: token,
+    e: ctx.session.userEmail || driveSession.userEmail || '',
+    n: ctx.session.userName || driveSession.userName || 'مستخدم Google Drive',
+    c: ctx.chatId || adminConfig.ownerChatId || '',
+    fid: ctx.session.activeFolderId || driveSession.activeFolderId || '',
+    fn: ctx.session.activeFolderName || driveSession.activeFolderName || 'Telegram Bot Uploads',
+  };
+  const sessionCode = `TD1_${Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')}`;
+  res.json({
+    ok: true,
+    sessionCode,
+    accessToken: payload.t,
+    userEmail: payload.e,
+    userName: payload.n,
+    chatId: payload.c,
+    activeFolderId: payload.fid,
+    activeFolderName: payload.fn,
+  });
+});
+
+// Push active Google Drive session & Telegram webhook directly to a Vercel deployment URL
+app.post('/api/vercel/push-session', async (req, res) => {
+  const ctx = resolveRequestUserContext(req);
+  const authHeader = req.headers.authorization;
+  const headerToken =
+    authHeader && authHeader.startsWith('Bearer ') ? authHeader.replace('Bearer ', '').trim() : '';
+
+  const { vercelUrl, accessToken, userEmail, userName, chatId, sendToTelegram } = req.body || {};
+  const token = accessToken || headerToken || ctx.session.accessToken || driveSession.accessToken;
+  if (!token) {
+    res.status(400).json({
+      error: 'يرجى تسجيل الدخول بحسابك في Google Drive هنا أولاً قبل نقل الجلسة إلى Vercel.',
+    });
+    return;
+  }
+
+  let cleanOrigin = typeof vercelUrl === 'string' ? vercelUrl.trim().replace(/\/+$/, '') : '';
+  if (cleanOrigin && !/^https?:\/\//i.test(cleanOrigin)) {
+    cleanOrigin = `https://${cleanOrigin}`;
+  }
+  try {
+    if (cleanOrigin) {
+      const parsed = new URL(cleanOrigin);
+      cleanOrigin = parsed.origin;
+    }
+  } catch {
+    res.status(400).json({ error: 'يرجى إدخال رابط Vercel صالح (مثال: https://your-app.vercel.app).' });
+    return;
+  }
+
+  const payload = {
+    t: token,
+    e: userEmail || ctx.session.userEmail || driveSession.userEmail || '',
+    n: userName || ctx.session.userName || driveSession.userName || 'مستخدم Google Drive',
+    c: chatId || ctx.chatId || adminConfig.ownerChatId || '',
+    fid: ctx.session.activeFolderId || driveSession.activeFolderId || '',
+    fn: ctx.session.activeFolderName || driveSession.activeFolderName || 'Telegram Bot Uploads',
+  };
+  const sessionCode = `TD1_${Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')}`;
+  const magicLoginUrl = cleanOrigin ? `${cleanOrigin}/?magicAuth=${encodeURIComponent(sessionCode)}` : '';
+
+  let remoteSynced = false;
+  let webhookSynced = false;
+  let remoteError = '';
+
+  if (cleanOrigin) {
+    try {
+      const syncRes = await fetch(`${cleanOrigin}/api/drive/sync`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          userEmail: payload.e,
+          userName: payload.n,
+          chatId: payload.c || undefined,
+          folderId: payload.fid || undefined,
+          folderName: payload.fn,
+        }),
+        signal: AbortSignal.timeout(12000),
+      });
+      remoteSynced = syncRes.ok;
+      if (!syncRes.ok) {
+        const errData = await syncRes.json().catch(() => ({}));
+        remoteError = errData?.error || `HTTP ${syncRes.status}`;
+      }
+    } catch (err: any) {
+      remoteError = err?.message || 'تعذر الاتصال بخادم Vercel';
+    }
+
+    try {
+      const whRes = await fetch(`${cleanOrigin}/api/bot/webhook`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ origin: cleanOrigin }),
+        signal: AbortSignal.timeout(10000),
+      });
+      webhookSynced = whRes.ok;
+    } catch {
+      // Ignore optional webhook error
+    }
+  }
+
+  const targetChat = Number(payload.c) || adminConfig.ownerChatId;
+  if (sendToTelegram !== false && targetChat) {
+    const msgLines = [
+      `🌐 <b>تم تجهيز ربط حسابك الشخصي (${payload.e || payload.n}) لمنصة Vercel بنجاح!</b>`,
+      ``,
+      cleanOrigin
+        ? `✅ <b>حالة المزامنة المباشرة مع موقعك:</b> ${
+            remoteSynced ? 'تم ربط حسابك على خادم Vercel بنجاح!' : 'استخدم الرابط أو الكود بالأسفل'
+          }`
+        : '',
+      `🔑 <b>كود التفعيل السريع (اضغط لنسخه ولصقه في موقع Vercel):</b>`,
+      `<code>${sessionCode}</code>`,
+    ].filter(Boolean);
+
+    const inlineKeyboard: any[][] = [];
+    if (magicLoginUrl && magicLoginUrl.startsWith('https://')) {
+      inlineKeyboard.push([
+        {
+          text: '🚀 فتح موقعك على Vercel بالحساب المربوط جاهزاً',
+          url: magicLoginUrl,
+        },
+      ]);
+    }
+    await sendTelegramMessage(
+      targetChat,
+      msgLines.join('\n'),
+      undefined,
+      inlineKeyboard.length > 0 ? { inline_keyboard: inlineKeyboard } : undefined
+    ).catch(() => {});
+  }
+
+  res.json({
+    ok: true,
+    remoteSynced,
+    webhookSynced,
+    remoteError: remoteError || null,
+    sessionCode,
+    magicLoginUrl: magicLoginUrl || null,
+    userEmail: payload.e,
+  });
 });
 
 // Admin & Personal Settings Portal API Endpoint

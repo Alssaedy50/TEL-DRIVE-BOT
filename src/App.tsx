@@ -63,6 +63,7 @@ const STORAGE_EMAIL_KEY = 'tg_drive_personal_email';
 const STORAGE_NAME_KEY = 'tg_drive_personal_name';
 const STORAGE_CHAT_ID_KEY = 'tg_drive_personal_chat_id';
 const STORAGE_CUSTOM_CLIENT_ID_KEY = 'tg_drive_custom_google_client_id';
+const STORAGE_VERCEL_URL_KEY = 'tg_drive_target_vercel_url';
 
 type CompressMode = 'none' | 'zip' | 'media';
 type ModalType = 'menu' | 'drive_files' | 'large_upload' | 'settings' | 'admin' | 'url_options' | null;
@@ -133,6 +134,7 @@ interface ServerStatus {
   };
   drive: {
     connected: boolean;
+    activeAccessToken?: string | null;
     accountEnabled: boolean;
     userEmail: string | null;
     userName: string | null;
@@ -196,12 +198,21 @@ export default function App() {
     return localStorage.getItem(STORAGE_CHAT_ID_KEY) || '';
   });
 
-  // Custom Google Client ID support (for Vercel deployments)
+  // Custom Google Client ID & Vercel Session Bridge support
   const [customClientId, setCustomClientId] = useState<string>(() => {
     return localStorage.getItem(STORAGE_CUSTOM_CLIENT_ID_KEY) || '';
   });
   const [unauthorizedDomainHost, setUnauthorizedDomainHost] = useState<string | null>(null);
   const [copiedDomain, setCopiedDomain] = useState(false);
+  const [copiedOrigin, setCopiedOrigin] = useState(false);
+  const [sessionCodeInput, setSessionCodeInput] = useState('');
+  const [applyingSessionCode, setApplyingSessionCode] = useState(false);
+  const [targetVercelUrl, setTargetVercelUrl] = useState<string>(() => {
+    return localStorage.getItem(STORAGE_VERCEL_URL_KEY) || '';
+  });
+  const [pushingToVercel, setPushingToVercel] = useState(false);
+  const [copiedSessionCode, setCopiedSessionCode] = useState(false);
+  const [magicLoginUrlResult, setMagicLoginUrlResult] = useState<string | null>(null);
 
   // Google OAuth state
   const [accessToken, setAccessToken] = useState<string | null>(null);
@@ -254,6 +265,9 @@ export default function App() {
   const [bannerError, setBannerError] = useState<string | null>(null);
   const [bannerSuccess, setBannerSuccess] = useState<string | null>(null);
 
+  const hasCustomOrEnvClientId = Boolean(
+    customClientId.trim() || (import.meta as any).env?.VITE_GOOGLE_CLIENT_ID
+  );
   const clientId =
     customClientId.trim() ||
     (import.meta as any).env?.VITE_GOOGLE_CLIENT_ID ||
@@ -307,10 +321,22 @@ export default function App() {
         setPersonalChatId(cid);
         localStorage.setItem(STORAGE_CHAT_ID_KEY, cid);
       }
+      if (data.drive.connected && data.drive.activeAccessToken && !accessToken) {
+        setAccessToken(data.drive.activeAccessToken);
+        saveStoredToken(data.drive.activeAccessToken);
+        if (data.drive.userEmail && !personalEmail) {
+          setPersonalEmail(data.drive.userEmail);
+          localStorage.setItem(STORAGE_EMAIL_KEY, data.drive.userEmail);
+        }
+        if (data.drive.userName && !personalName) {
+          setPersonalName(data.drive.userName);
+          localStorage.setItem(STORAGE_NAME_KEY, data.drive.userName);
+        }
+      }
     } catch {
       // Ignore transient poll errors
     }
-  }, [buildIdentityQuery, selectedFolderId, personalChatId]);
+  }, [buildIdentityQuery, selectedFolderId, personalChatId, accessToken, personalEmail, personalName]);
 
   useEffect(() => {
     fetchStatus();
@@ -465,6 +491,126 @@ export default function App() {
     }
   };
 
+  const applyPortableSessionCode = async (rawCode: string) => {
+    const clean = rawCode.trim();
+    if (!clean) return;
+    setApplyingSessionCode(true);
+    setBannerError(null);
+    try {
+      let token = clean;
+      let email = personalEmail;
+      let name = personalName || 'مستخدم Google Drive';
+      let chatId = personalChatId;
+
+      if (clean.startsWith('TD1_')) {
+        const b64 = clean.slice(4).replace(/-/g, '+').replace(/_/g, '/');
+        const binary = atob(b64);
+        const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+        const decodedJson = JSON.parse(new TextDecoder().decode(bytes));
+        if (!decodedJson?.t) {
+          throw new Error('كود الجلسة غير صالح.');
+        }
+        token = decodedJson.t;
+        if (decodedJson.e) email = decodedJson.e;
+        if (decodedJson.n) name = decodedJson.n;
+        if (decodedJson.c) chatId = String(decodedJson.c);
+      }
+
+      if (chatId) {
+        setPersonalChatId(chatId);
+        localStorage.setItem(STORAGE_CHAT_ID_KEY, chatId);
+      }
+      saveStoredToken(token);
+      setAccessToken(token);
+      setUnauthorizedDomainHost(null);
+      setSessionCodeInput('');
+      await onGoogleAuthenticated(token, { name, email });
+    } catch (err: any) {
+      setBannerError(err?.message || 'كود الجلسة المدخل غير صالح أو منتهي الصلاحية.');
+    } finally {
+      setApplyingSessionCode(false);
+    }
+  };
+
+  // Auto-apply ?magicAuth=TD1_... when opening Vercel via Magic Link
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const magic = params.get('magicAuth');
+    if (magic && magic.trim()) {
+      params.delete('magicAuth');
+      const nextQuery = params.toString();
+      const nextUrl = `${window.location.pathname}${nextQuery ? `?${nextQuery}` : ''}${window.location.hash}`;
+      window.history.replaceState({}, '', nextUrl);
+      applyPortableSessionCode(magic.trim());
+    }
+  }, []);
+
+  const handleCopyPortableSessionCode = async () => {
+    setBannerError(null);
+    try {
+      const headers: Record<string, string> = {};
+      if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+      const res = await fetch(`/api/drive/export-session${buildIdentityQuery()}`, { headers });
+      const data = await res.json();
+      if (!res.ok || !data.sessionCode) {
+        throw new Error(data.error || 'تعذر استخراج كود الجلسة.');
+      }
+      await navigator.clipboard.writeText(data.sessionCode);
+      setCopiedSessionCode(true);
+      setTimeout(() => setCopiedSessionCode(false), 3000);
+      setBannerSuccess('تم نسخ كود الجلسة السريع! الصقه في موقعك على Vercel ليتم ربط حسابك فوراً.');
+      setTimeout(() => setBannerSuccess(null), 5000);
+    } catch (err: any) {
+      setBannerError(err?.message || 'تعذر نسخ كود الجلسة.');
+    }
+  };
+
+  const handlePushSessionToVercel = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    setPushingToVercel(true);
+    setBannerError(null);
+    setMagicLoginUrlResult(null);
+    try {
+      if (targetVercelUrl.trim()) {
+        localStorage.setItem(STORAGE_VERCEL_URL_KEY, targetVercelUrl.trim());
+      }
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+      const res = await fetch('/api/vercel/push-session', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          vercelUrl: targetVercelUrl.trim() || undefined,
+          accessToken: accessToken || undefined,
+          userEmail: effectiveUserEmail || undefined,
+          userName: effectiveUserName || undefined,
+          chatId: linkedChatId || personalChatId || undefined,
+          sendToTelegram: true,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'تعذر نقل الجلسة إلى Vercel.');
+      }
+      if (data.sessionCode) {
+        await navigator.clipboard.writeText(data.sessionCode).catch(() => {});
+      }
+      if (data.magicLoginUrl) {
+        setMagicLoginUrlResult(data.magicLoginUrl);
+      }
+      setBannerSuccess(
+        data.remoteSynced
+          ? 'تم ربط حسابك في Google Drive وتفعيل البوت على موقعك في Vercel مباشرة بنجاح! كما تم إرسال رابط التفعيل إلى تليجرام.'
+          : 'تم نسخ كود التفعيل وإرساله إلى محادثتك في تليجرام! الصقه في موقع Vercel لتفعيله فوراً.'
+      );
+      setTimeout(() => setBannerSuccess(null), 6000);
+    } catch (err: any) {
+      setBannerError(err?.message || 'حدث خطأ أثناء مزامنة الجلسة مع Vercel.');
+    } finally {
+      setPushingToVercel(false);
+    }
+  };
+
   const handleSignIn = async () => {
     setBannerError(null);
     setUnauthorizedDomainHost(null);
@@ -480,17 +626,22 @@ export default function App() {
         return;
       }
     } catch (err: any) {
-      if (tokenClientRef.current) {
-        tokenClientRef.current.requestAccessToken({ prompt: 'select_account' });
-        return;
-      }
+      // Check unauthorized domain FIRST so we never trigger Google's 400: origin_mismatch popup
       if (err?.code === 'auth/unauthorized-domain') {
+        if (hasCustomOrEnvClientId && tokenClientRef.current) {
+          tokenClientRef.current.requestAccessToken({ prompt: 'select_account' });
+          return;
+        }
         const currentHost = window.location.hostname;
         setUnauthorizedDomainHost(currentHost);
         setActiveModal('settings');
         setBannerError(
-          `النطاق (${currentHost}) غير مضاف بعد في قائمة النطاقات المصرح بها في Firebase. راجع الخطوة الموضحة في نافذة الإعدادات.`
+          `النطاق (${currentHost}) غير مضاف بعد في Google Cloud / Firebase. يمكنك الربط فوراً عبر "كود الجلسة السريع" بالأسفل بدون أي إعدادات، أو إضافة النطاق في خطوتين.`
         );
+        return;
+      }
+      if (tokenClientRef.current) {
+        tokenClientRef.current.requestAccessToken({ prompt: 'select_account' });
         return;
       }
       if (err?.code !== 'auth/popup-closed-by-user') {
@@ -1912,27 +2063,86 @@ export default function App() {
               {activeModal === 'settings' && (
                 <div className="space-y-5">
                   {unauthorizedDomainHost && (
-                    <div className="p-4 rounded-xl bg-amber-950/60 border border-amber-500/40 space-y-2.5 text-xs">
-                      <p className="font-bold text-amber-200">
-                        لتفعيل نافذة تسجيل الدخول بـ Google على دومين Vercel الجديد ({unauthorizedDomainHost}):
+                    <div className="p-4 rounded-xl bg-amber-950/60 border border-amber-500/40 space-y-3 text-xs">
+                      <p className="font-bold text-amber-200 text-sm">
+                        لماذا ظهر خطأ (origin_mismatch) على دومين Vercel ({unauthorizedDomainHost})؟ وكيف تربط حسابك فوراً؟
                       </p>
                       <p className="text-amber-100/90 leading-relaxed">
-                        انسخ النطاق أدناه وأضفه في لوحة تحكم Firebase (Authentication → Settings → Authorized domains) ليعمل الدخول بضغطة زر على هذا النطاق:
+                        أمان Google OAuth يمنع فتح نافذة الدخول على أي رابط جديد غير مسجل. لديك <strong>حلّان</strong>:
                       </p>
-                      <div className="flex items-center justify-between gap-2 p-2 rounded-lg bg-slate-950 border border-amber-500/30">
-                        <code className="text-amber-300 font-mono truncate" dir="ltr">
-                          {unauthorizedDomainHost}
-                        </code>
-                        <button
-                          onClick={() => {
-                            navigator.clipboard.writeText(unauthorizedDomainHost);
-                            setCopiedDomain(true);
-                            setTimeout(() => setCopiedDomain(false), 2000);
-                          }}
-                          className="px-2.5 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 font-semibold cursor-pointer shrink-0"
-                        >
-                          {copiedDomain ? 'تم النسخ' : 'نسخ النطاق'}
-                        </button>
+                      <div className="p-3 rounded-lg bg-slate-950/90 border border-emerald-500/30 space-y-2">
+                        <p className="font-bold text-emerald-300">
+                          الحل الأول (فوري في ثانيتين بدون إعدادات Google Cloud):
+                        </p>
+                        <p className="text-slate-300">
+                          من تبويب البرنامج هنا في AI Studio اضغط <strong>"نسخ كود تفعيل الجلسة السريع لـ Vercel"</strong> أو أدخل رابط موقعك على Vercel واضغط <strong>"ربط موقع Vercel بحسابي الآن"</strong>، أو الصق الكود في الخانة أدناه!
+                        </p>
+                      </div>
+                      <div className="p-3 rounded-lg bg-slate-950/90 border border-amber-500/30 space-y-2.5">
+                        <p className="font-bold text-amber-300">
+                          الحل الثاني (لتفعيل زر الدخول المباشر من Google على دومين Vercel نهائياً):
+                        </p>
+                        <div className="space-y-1.5">
+                          <span className="text-slate-300 block">
+                            1. أضف هذا النطاق في{' '}
+                            <a
+                              href={`https://console.firebase.google.com/project/${(firebaseConfig as any).projectId}/authentication/settings`}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-sky-400 underline font-semibold"
+                            >
+                              Firebase Authorized Domains
+                            </a>
+                            :
+                          </span>
+                          <div className="flex items-center justify-between gap-2 p-2 rounded-lg bg-slate-900 border border-slate-800">
+                            <code className="text-amber-300 font-mono truncate" dir="ltr">
+                              {unauthorizedDomainHost}
+                            </code>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                navigator.clipboard.writeText(unauthorizedDomainHost);
+                                setCopiedDomain(true);
+                                setTimeout(() => setCopiedDomain(false), 2000);
+                              }}
+                              className="px-2.5 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 font-semibold cursor-pointer shrink-0"
+                            >
+                              {copiedDomain ? 'تم النسخ' : 'نسخ النطاق'}
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="space-y-1.5">
+                          <span className="text-slate-300 block">
+                            2. أضف هذا الرابط في{' '}
+                            <a
+                              href={`https://console.cloud.google.com/apis/credentials?project=${(firebaseConfig as any).projectId}`}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-sky-400 underline font-semibold"
+                            >
+                              Google Cloud Credentials (Authorized JavaScript origins)
+                            </a>
+                            :
+                          </span>
+                          <div className="flex items-center justify-between gap-2 p-2 rounded-lg bg-slate-900 border border-slate-800">
+                            <code className="text-emerald-300 font-mono truncate" dir="ltr">
+                              {window.location.origin}
+                            </code>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                navigator.clipboard.writeText(window.location.origin);
+                                setCopiedOrigin(true);
+                                setTimeout(() => setCopiedOrigin(false), 2000);
+                              }}
+                              className="px-2.5 py-1 rounded bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 font-semibold cursor-pointer shrink-0"
+                            >
+                              {copiedOrigin ? 'تم النسخ' : 'نسخ الرابط الكامل'}
+                            </button>
+                          </div>
+                        </div>
                       </div>
                     </div>
                   )}
@@ -1977,6 +2187,32 @@ export default function App() {
                             </button>
                           </>
                         )}
+                      </div>
+
+                      {/* Quick Session Code Paste Box for Instant Vercel Linking */}
+                      <div className="pt-2 border-t border-slate-800/80 space-y-2">
+                        <label className="block text-[11px] font-semibold text-slate-300">
+                          ربط فوري على Vercel بكود الجلسة (يتجاوز خطأ origin_mismatch بدون إعدادات):
+                        </label>
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            type="text"
+                            dir="ltr"
+                            value={sessionCodeInput}
+                            onChange={(e) => setSessionCodeInput(e.target.value)}
+                            placeholder="الصق كود الجلسة TD1_... هنا"
+                            className="flex-1 px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-white placeholder-slate-500"
+                          />
+                          <button
+                            type="button"
+                            disabled={applyingSessionCode || !sessionCodeInput.trim()}
+                            onClick={() => applyPortableSessionCode(sessionCodeInput)}
+                            className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-bold cursor-pointer shrink-0 flex items-center gap-1"
+                          >
+                            {applyingSessionCode ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
+                            <span>تفعيل</span>
+                          </button>
+                        </div>
                       </div>
                     </div>
 
@@ -2034,6 +2270,71 @@ export default function App() {
                       </div>
                     </div>
                   </div>
+
+                  {/* 1-Click Vercel Remote Sync Bridge (When Drive is Connected here) */}
+                  {driveConnected && (
+                    <div className="p-4 rounded-xl bg-emerald-950/30 border border-emerald-500/30 space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          <p className="text-xs font-bold text-emerald-300 flex items-center gap-1.5">
+                            <Globe className="w-4 h-4 text-emerald-400" />
+                            <span>ربط وتفعيل موقعك على Vercel بحسابك الحالي بضغطة واحدة</span>
+                          </p>
+                          <p className="text-[11px] text-slate-400 mt-0.5">
+                            انقل جلسة Google Drive ({effectiveUserEmail}) إلى موقعك على Vercel مباشرة بدون الحاجة لإعدادات Google Cloud:
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={handleCopyPortableSessionCode}
+                          className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-emerald-500/40 text-emerald-300 text-xs font-semibold flex items-center gap-1.5 cursor-pointer shrink-0"
+                        >
+                          {copiedSessionCode ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                          <span>{copiedSessionCode ? 'تم نسخ الكود!' : 'نسخ كود تفعيل الجلسة'}</span>
+                        </button>
+                      </div>
+
+                      <form onSubmit={handlePushSessionToVercel} className="flex flex-col sm:flex-row gap-2">
+                        <input
+                          type="text"
+                          dir="ltr"
+                          value={targetVercelUrl}
+                          onChange={(e) => setTargetVercelUrl(e.target.value)}
+                          placeholder="https://your-project.vercel.app (رابط موقعك على Vercel)"
+                          className="flex-1 px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-xs text-white placeholder-slate-500"
+                        />
+                        <button
+                          type="submit"
+                          disabled={pushingToVercel}
+                          className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer shrink-0"
+                        >
+                          {pushingToVercel ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <Send className="w-3.5 h-3.5" />
+                          )}
+                          <span>ربط موقع Vercel الآن وإرسال الرابط لتليجرام</span>
+                        </button>
+                      </form>
+
+                      {magicLoginUrlResult && (
+                        <div className="pt-1 flex items-center justify-between gap-2 p-2.5 rounded-lg bg-slate-950 border border-emerald-500/40 text-xs">
+                          <span className="text-emerald-300 font-semibold truncate">
+                            تم الربط! افتح موقعك على Vercel بالحساب جاهزاً:
+                          </span>
+                          <a
+                            href={magicLoginUrlResult}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-bold flex items-center gap-1 shrink-0"
+                          >
+                            <span>فتح موقعي على Vercel</span>
+                            <ExternalLink className="w-3.5 h-3.5" />
+                          </a>
+                        </div>
+                      )}
+                    </div>
+                  )}
 
                   {/* Preferences */}
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
