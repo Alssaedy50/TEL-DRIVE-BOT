@@ -8,7 +8,6 @@ import {
   AlertTriangle,
   ExternalLink,
   FileText,
-  Folder,
   UploadCloud,
   Trash2,
   Copy,
@@ -30,6 +29,9 @@ import {
   Smartphone,
   Sliders,
   User,
+  Menu,
+  ChevronLeft,
+  ArrowRight,
 } from 'lucide-react';
 import {
   listFolders,
@@ -63,12 +65,12 @@ const STORAGE_CHAT_ID_KEY = 'tg_drive_personal_chat_id';
 const STORAGE_CUSTOM_CLIENT_ID_KEY = 'tg_drive_custom_google_client_id';
 
 type CompressMode = 'none' | 'zip' | 'media';
-type ModalType = 'drive_files' | 'large_upload' | 'settings' | 'admin' | 'url_options' | null;
+type ModalType = 'menu' | 'drive_files' | 'large_upload' | 'settings' | 'admin' | 'url_options' | null;
 
 interface TransferJob {
   id: string;
   source?: 'telegram' | 'url' | 'web' | 'drive_to_telegram' | 'url_to_telegram';
-  direction?: 'to_drive' | 'to_telegram';
+  direction?: 'to_drive' | 'to_telegram' | 'to_device';
   protocol?: 'bot_api' | 'mtproto' | 'http';
   mediaFormat?: 'video' | 'audio';
   quality?: string;
@@ -212,7 +214,7 @@ export default function App() {
   const [autoCategorize, setAutoCategorize] = useState(true);
   const [skipDuplicates, setSkipDuplicates] = useState(true);
 
-  // Popup Modal State (All menus hidden inside popup modals)
+  // Popup Modal State ('menu' opens the popup launcher; each option opens its own popup page)
   const [activeModal, setActiveModal] = useState<ModalType>(null);
   const [savingSettings, setSavingSettings] = useState(false);
   const [sendingDriveFileId, setSendingDriveFileId] = useState<string | null>(null);
@@ -245,6 +247,8 @@ export default function App() {
   const [externalCompressMode, setExternalCompressMode] = useState<CompressMode>('none');
   const [submittingUrl, setSubmittingUrl] = useState(false);
   const [clearingFailed, setClearingFailed] = useState(false);
+  const [downloadingItemId, setDownloadingItemId] = useState<string | null>(null);
+  const [lastDirectDownload, setLastDirectDownload] = useState<{ url: string; fileName: string } | null>(null);
 
   // Alerts
   const [bannerError, setBannerError] = useState<string | null>(null);
@@ -580,36 +584,109 @@ export default function App() {
     await handleUpdateSettings({ deduplicate: nextVal });
   };
 
+  const handleAuthenticatedProxyDownload = async (
+    proxyUrl: string,
+    fallbackFileName: string,
+    itemId: string
+  ) => {
+    setDownloadingItemId(itemId);
+    setBannerError(null);
+    try {
+      const headers: Record<string, string> = {};
+      if (accessToken) {
+        headers.Authorization = `Bearer ${accessToken}`;
+      }
+      const res = await fetch(proxyUrl, { headers });
+      const contentType = (res.headers.get('content-type') || '').toLowerCase();
+      if (!res.ok || contentType.includes('application/json') || contentType.includes('text/html')) {
+        let errMsg = 'تعذر تحميل الملف المباشر.';
+        try {
+          const errJson = await res.json();
+          if (errJson?.error) errMsg = errJson.error;
+        } catch {
+          // Ignore parse error
+        }
+        throw new Error(errMsg);
+      }
+
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = blobUrl;
+      a.download = fallbackFileName || 'download';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+      setBannerSuccess(`تم تحميل الملف "${fallbackFileName}" إلى جهازك بنجاح!`);
+      setTimeout(() => setBannerSuccess(null), 5000);
+    } catch (err: any) {
+      setBannerError(err?.message || 'حدث خطأ أثناء تحميل الملف إلى جهازك.');
+    } finally {
+      setDownloadingItemId(null);
+    }
+  };
+
   const handleUrlUploadSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!externalUrlInput.trim()) return;
 
+    setSubmittingUrl(true);
+    setBannerError(null);
+    setLastDirectDownload(null);
+
     if (externalDestination === 'device') {
-      const q = new URLSearchParams({
-        url: externalUrlInput.trim(),
-        format: externalMediaFormat,
-        quality: externalQuality,
-        compress: externalCompressMode,
-      });
-      if (externalCustomName.trim()) {
-        q.set('name', externalCustomName.trim());
+      try {
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (accessToken) {
+          headers.Authorization = `Bearer ${accessToken}`;
+        }
+        const res = await fetch('/api/transfers/resolve-direct', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            url: externalUrlInput.trim(),
+            customFileName: externalCustomName.trim() || undefined,
+            mediaFormat: externalMediaFormat,
+            quality: externalQuality,
+            compressMode: externalCompressMode,
+            userEmail: personalEmail || undefined,
+            targetChatId: personalChatId || undefined,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || 'تعذر استخراج رابط التحميل المباشر.');
+        }
+
+        setExternalUrlInput('');
+        setExternalCustomName('');
+        fetchStatus();
+
+        if (data.preferDirectCdn && data.directStreamUrl) {
+          setLastDirectDownload({ url: data.directStreamUrl, fileName: data.fileName });
+          const a = document.createElement('a');
+          a.href = data.directStreamUrl;
+          a.rel = 'noopener noreferrer';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setBannerSuccess(`تم تجهيز "${data.fileName}" وبدأ التحميل المباشر إلى جهازك!`);
+        } else if (data.proxyDownloadUrl) {
+          await handleAuthenticatedProxyDownload(
+            data.proxyDownloadUrl,
+            data.fileName || 'download',
+            data.job?.id || 'direct'
+          );
+        }
+      } catch (err: any) {
+        setBannerError(err?.message || 'حدث خطأ أثناء استخراج وتحميل الرابط.');
+      } finally {
+        setSubmittingUrl(false);
       }
-      if (personalEmail) q.set('userEmail', personalEmail);
-      if (personalChatId) q.set('chatId', personalChatId);
-      const downloadHref = `/api/direct-download?${q.toString()}`;
-      const a = document.createElement('a');
-      a.href = downloadHref;
-      a.download = externalCustomName.trim() || '';
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setBannerSuccess('بدأ تحضير وتحميل الملف مباشرة إلى جهازك عبر المتصفح!');
-      setTimeout(() => setBannerSuccess(null), 4000);
       return;
     }
 
-    setSubmittingUrl(true);
-    setBannerError(null);
     try {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       if (accessToken) {
@@ -905,73 +982,40 @@ export default function App() {
     externalCompressMode === 'zip' ? 'ZIP' : externalCompressMode === 'media' ? 'ضغط FFmpeg' : 'بدون ضغط';
 
   return (
-    <div dir="rtl" className="min-h-screen bg-[#090D16] text-slate-100 font-sans flex flex-col">
-      {/* Single Clean Top Bar — Fits 100% on Mobile & Desktop Without Truncation or Disappearing Links */}
-      <header className="px-3 sm:px-6 py-3 border-b border-slate-800/80 bg-[#0D1322]/95 backdrop-blur-md sticky top-0 z-30">
-        <div className="max-w-5xl mx-auto flex items-center justify-between gap-2 sm:gap-6">
-          {/* Zone 1: Brand Title */}
-          <div className="flex items-center gap-2 shrink-0">
-            <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-sky-500/15 border border-sky-500/30 flex items-center justify-center text-sky-400">
-              <Send className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+    <div dir="rtl" className="min-h-screen w-full max-w-full overflow-x-hidden bg-[#090D16] text-slate-100 font-sans flex flex-col">
+      {/* Ultra-Clean Fixed Top Header: Only Brand + Single Popup Menu Trigger */}
+      <header className="w-full px-4 sm:px-6 py-3 border-b border-slate-800/80 bg-[#0D1322]/95 backdrop-blur-md sticky top-0 z-30">
+        <div className="max-w-4xl mx-auto flex items-center justify-between gap-3">
+          {/* Brand Title */}
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="w-8 h-8 rounded-lg bg-sky-500/15 border border-sky-500/30 flex items-center justify-center text-sky-400 shrink-0">
+              <Send className="w-4 h-4" />
             </div>
-            <span className="text-sm sm:text-base font-bold text-white tracking-tight whitespace-nowrap">
-              TeleDrive
+            <span className="text-base font-bold text-white tracking-tight truncate">
+              TeleDrive Cloud
             </span>
           </div>
 
-          {/* Zone 2: Popup Menu Links (Always Visible on Mobile & Desktop) */}
-          <nav className="flex items-center gap-1 sm:gap-2">
-            <button
-              onClick={() => {
-                setActiveModal('drive_files');
-                if (accessToken) refreshDriveFoldersAndFiles();
-              }}
-              className="px-2 sm:px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-200 text-xs font-medium flex items-center gap-1.5 transition cursor-pointer whitespace-nowrap shrink-0"
-            >
-              <HardDrive className="w-3.5 h-3.5 text-sky-400 shrink-0" />
-              <span>ملفاتي</span>
-            </button>
-
-            <button
-              onClick={() => setActiveModal('large_upload')}
-              className="px-2 sm:px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-200 text-xs font-medium flex items-center gap-1.5 transition cursor-pointer whitespace-nowrap shrink-0"
-            >
-              <UploadCloud className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
-              <span>رفع ضخم</span>
-            </button>
-
-            <button
-              onClick={() => setActiveModal('admin')}
-              className="px-2 sm:px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-200 text-xs font-medium flex items-center gap-1.5 transition cursor-pointer whitespace-nowrap shrink-0"
-            >
-              <ShieldAlert className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-              <span>الإدارة</span>
-            </button>
-          </nav>
-
-          {/* Zone 3: Single Unified Account & Settings Popup Trigger */}
+          {/* Single Popup Menu Button — Hides All Top Options Inside a Popup Menu */}
           <button
-            onClick={() => setActiveModal('settings')}
-            className={`px-2.5 sm:px-3.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer whitespace-nowrap shrink-0 ${
-              driveConnected
-                ? 'bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30'
-                : 'bg-sky-600 hover:bg-sky-500 text-white'
-            }`}
+            type="button"
+            onClick={() => setActiveModal('menu')}
+            className="px-3.5 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold flex items-center gap-2 transition cursor-pointer shrink-0 shadow-sm"
           >
-            <User className="w-3.5 h-3.5 shrink-0" />
-            <span>{driveConnected ? 'حسابي متصل' : 'ربط الحساب'}</span>
+            <Menu className="w-4 h-4 shrink-0" />
+            <span>القائمة والخيارات</span>
           </button>
         </div>
       </header>
 
-      {/* Main Focused Workspace */}
-      <main className="flex-1 max-w-5xl w-full mx-auto px-3.5 sm:px-6 py-4 sm:py-6 space-y-4 sm:space-y-5">
+      {/* Main Focused Workspace — Locked Width, Zero Horizontal Scroll */}
+      <main className="flex-1 w-full max-w-4xl mx-auto px-3.5 sm:px-6 py-4 sm:py-6 space-y-4">
         {/* Notification Banners */}
         {bannerError && (
           <div className="p-3.5 rounded-xl bg-rose-950/70 border border-rose-500/40 text-rose-200 flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2.5 text-xs sm:text-sm">
+            <div className="flex items-center gap-2.5 text-xs sm:text-sm min-w-0">
               <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
-              <span>{bannerError}</span>
+              <span className="break-words">{bannerError}</span>
             </div>
             <button onClick={() => setBannerError(null)} className="text-xs text-rose-300 hover:text-white shrink-0 cursor-pointer">
               إغلاق
@@ -980,30 +1024,50 @@ export default function App() {
         )}
 
         {bannerSuccess && (
-          <div className="p-3.5 rounded-xl bg-emerald-950/70 border border-emerald-500/40 text-emerald-200 flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2.5 text-xs sm:text-sm">
+          <div className="p-3.5 rounded-xl bg-emerald-950/70 border border-emerald-500/40 text-emerald-200 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 text-xs sm:text-sm min-w-0">
               <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-              <span>{bannerSuccess}</span>
+              <span className="break-words">{bannerSuccess}</span>
             </div>
-            <button onClick={() => setBannerSuccess(null)} className="text-xs text-emerald-300 hover:text-white shrink-0 cursor-pointer">
-              إغلاق
-            </button>
+            <div className="flex items-center gap-2 shrink-0">
+              {lastDirectDownload && (
+                <a
+                  href={lastDirectDownload.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-3 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center gap-1.5"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>تنزيل مباشر</span>
+                </a>
+              )}
+              <button
+                onClick={() => {
+                  setBannerSuccess(null);
+                  setLastDirectDownload(null);
+                }}
+                className="text-xs text-emerald-300 hover:text-white cursor-pointer"
+              >
+                إغلاق
+              </button>
+            </div>
           </div>
         )}
 
-        {/* Interactive Status Bar (Opens Settings or Drive Folder Popup When Clicked) */}
-        <div
+        {/* Interactive Account Summary Strip (Opens Settings Popup When Tapped) */}
+        <button
+          type="button"
           onClick={() => setActiveModal('settings')}
-          className="px-4 py-3 rounded-xl bg-[#0D1322] hover:bg-slate-900/90 border border-slate-800/90 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400 cursor-pointer transition"
+          className="w-full text-right px-4 py-3 rounded-xl bg-[#0D1322] hover:bg-slate-900/90 border border-slate-800/90 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400 cursor-pointer transition"
         >
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 min-w-0">
             <span className={driveConnected ? 'text-emerald-300 font-semibold' : 'text-amber-300 font-semibold'}>
               {driveConnected
-                ? `Google Drive: ${effectiveUserEmail || effectiveUserName}`
+                ? `حسابك: ${effectiveUserEmail || effectiveUserName}`
                 : 'اضغط هنا لربط Google Drive وتليجرام'}
             </span>
             <span aria-hidden="true">·</span>
-            <span>
+            <span className="truncate">
               المجلد: <strong className="text-slate-200">{serverStatus?.drive.activeFolderName || selectedFolderName}</strong>
             </span>
             <span aria-hidden="true">·</span>
@@ -1019,10 +1083,10 @@ export default function App() {
             <span aria-hidden="true">·</span>
             <span dir="ltr">{formatBytes(serverStatus?.stats.totalBytesTransferred ?? 0)}</span>
           </div>
-        </div>
+        </button>
 
         {/* Core Card 1: Multi-Platform URL & Video Puller */}
-        <section className="bg-[#0D1322] border border-slate-800/90 rounded-2xl p-4 sm:p-6 space-y-4">
+        <section className="w-full bg-[#0D1322] border border-slate-800/90 rounded-2xl p-4 sm:p-6 space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
               <h1 className="text-base sm:text-lg font-bold text-white">
@@ -1037,7 +1101,7 @@ export default function App() {
             <button
               type="button"
               onClick={() => setActiveModal('url_options')}
-              className="self-start sm:self-auto px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700/80 text-slate-200 text-xs font-medium flex items-center gap-2 transition cursor-pointer whitespace-nowrap shrink-0"
+              className="self-start sm:self-auto px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700/80 text-slate-200 text-xs font-medium flex items-center gap-2 transition cursor-pointer shrink-0"
             >
               <Sliders className="w-3.5 h-3.5 text-sky-400 shrink-0" />
               <span>
@@ -1047,12 +1111,12 @@ export default function App() {
           </div>
 
           <form onSubmit={handleUrlUploadSubmit} className="space-y-3.5">
-            {/* Destination Segmented Control — Concise Labels that Never Truncate on Mobile */}
+            {/* Destination Segmented Control */}
             <div className="grid grid-cols-3 gap-1.5 p-1 rounded-xl bg-slate-950 border border-slate-800/80">
               <button
                 type="button"
                 onClick={() => setExternalDestination('drive')}
-                className={`py-2 px-2 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer whitespace-nowrap ${
+                className={`py-2 px-1.5 rounded-lg text-xs font-semibold flex items-center justify-center gap-1 transition cursor-pointer ${
                   externalDestination === 'drive'
                     ? 'bg-emerald-600 text-white shadow-sm'
                     : 'text-slate-400 hover:text-slate-200'
@@ -1064,7 +1128,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setExternalDestination('telegram')}
-                className={`py-2 px-2 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer whitespace-nowrap ${
+                className={`py-2 px-1.5 rounded-lg text-xs font-semibold flex items-center justify-center gap-1 transition cursor-pointer ${
                   externalDestination === 'telegram'
                     ? 'bg-sky-600 text-white shadow-sm'
                     : 'text-slate-400 hover:text-slate-200'
@@ -1076,7 +1140,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setExternalDestination('device')}
-                className={`py-2 px-2 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer whitespace-nowrap ${
+                className={`py-2 px-1.5 rounded-lg text-xs font-semibold flex items-center justify-center gap-1 transition cursor-pointer ${
                   externalDestination === 'device'
                     ? 'bg-indigo-600 text-white shadow-sm'
                     : 'text-slate-400 hover:text-slate-200'
@@ -1090,18 +1154,18 @@ export default function App() {
             {/* URL Input & Single Submit Button */}
             <div className="flex flex-col sm:flex-row gap-2.5">
               <input
-                type="url"
+                type="text"
                 required
                 dir="ltr"
                 value={externalUrlInput}
                 onChange={(e) => setExternalUrlInput(e.target.value)}
                 placeholder="https://www.youtube.com/watch?v=... أو رابط TikTok / Drive / MediaFire..."
-                className="flex-1 px-4 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-sky-500"
+                className="w-full flex-1 px-4 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-sky-500"
               />
               <button
                 type="submit"
                 disabled={submittingUrl || !externalUrlInput.trim()}
-                className="px-6 py-2.5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-semibold text-sm transition flex items-center justify-center gap-2 shrink-0 cursor-pointer disabled:opacity-50 whitespace-nowrap"
+                className="w-full sm:w-auto px-6 py-2.5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-semibold text-sm transition flex items-center justify-center gap-2 shrink-0 cursor-pointer disabled:opacity-50"
               >
                 {submittingUrl ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
@@ -1119,7 +1183,7 @@ export default function App() {
         </section>
 
         {/* Core Card 2: Live Personal Transfer Queue & History */}
-        <section className="bg-[#0D1322] border border-slate-800/90 rounded-2xl p-4 sm:p-6 space-y-4">
+        <section className="w-full bg-[#0D1322] border border-slate-800/90 rounded-2xl p-4 sm:p-6 space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800/80 pb-3.5">
             <div className="flex items-center gap-2">
               <Activity className="w-4 h-4 text-sky-400" />
@@ -1130,7 +1194,7 @@ export default function App() {
               {(serverStatus?.stats.activeJobs || 0) + (serverStatus?.stats.waitingAuthJobs || 0) > 0 && (
                 <button
                   onClick={() => handleCancelAllJobs('personal')}
-                  className="px-3 py-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-rose-300 text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer whitespace-nowrap"
+                  className="px-3 py-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-rose-300 text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
                 >
                   <Ban className="w-3.5 h-3.5" />
                   <span>إلغاء الجارية</span>
@@ -1141,7 +1205,7 @@ export default function App() {
                 <button
                   onClick={handleClearFailedJobs}
                   disabled={clearingFailed}
-                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer whitespace-nowrap"
+                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
                 >
                   <Trash2 className="w-3.5 h-3.5 text-rose-400" />
                   <span>مسح الفاشلة ({serverStatus?.stats.failedJobs})</span>
@@ -1151,7 +1215,7 @@ export default function App() {
           </div>
 
           {!serverStatus || serverStatus.jobs.length === 0 ? (
-            <div className="py-10 text-center border border-dashed border-slate-800 rounded-xl space-y-1.5">
+            <div className="py-10 px-4 text-center border border-dashed border-slate-800 rounded-xl space-y-1.5">
               <p className="text-sm text-slate-300 font-medium">لا توجد عمليات نقل حالياً</p>
               <p className="text-xs text-slate-500">
                 ضع أي رابط في الأعلى أو أرسل ملفاً لبوت تليجرام لتظهر حالة النقل والسرعة هنا.
@@ -1180,11 +1244,16 @@ export default function App() {
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div className="flex items-center gap-2 min-w-0">
                         <FileText className="w-4 h-4 text-sky-400 shrink-0" />
-                        <span className="font-semibold text-sm text-white truncate max-w-xs sm:max-w-md" dir="auto">
+                        <span className="font-semibold text-sm text-white truncate max-w-[180px] sm:max-w-md" dir="auto">
                           {job.fileName}
                         </span>
-                        <span className="text-xs text-slate-400">
-                          · {job.direction === 'to_telegram' ? 'إلى تليجرام' : 'إلى Drive'}
+                        <span className="text-xs text-slate-400 shrink-0">
+                          ·{' '}
+                          {job.direction === 'to_telegram'
+                            ? 'إلى تليجرام'
+                            : job.direction === 'to_device'
+                            ? 'لجهازي'
+                            : 'إلى Drive'}
                         </span>
                       </div>
 
@@ -1274,18 +1343,46 @@ export default function App() {
                       </div>
 
                       <div className="flex items-center gap-3">
-                        {(job.driveFileId || job.directUrl) && (
-                          <a
-                            href={`/api/direct-download?jobId=${encodeURIComponent(job.id)}${
-                              personalEmail ? `&userEmail=${encodeURIComponent(personalEmail)}` : ''
-                            }${personalChatId ? `&chatId=${encodeURIComponent(personalChatId)}` : ''}`}
-                            download
-                            className="text-indigo-400 hover:text-indigo-300 font-semibold flex items-center gap-1"
-                          >
-                            <Download className="w-3.5 h-3.5" />
-                            <span>تحميل</span>
-                          </a>
-                        )}
+                        {(job.driveFileId || job.directUrl) &&
+                          (!job.driveFileId &&
+                          job.directUrl &&
+                          (job.directUrl.includes('savetube') ||
+                            job.directUrl.endsWith('.mp4') ||
+                            job.directUrl.endsWith('.mp3')) ? (
+                            <a
+                              href={job.directUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-indigo-400 hover:text-indigo-300 font-semibold flex items-center gap-1"
+                            >
+                              <Download className="w-3.5 h-3.5" />
+                              <span>تحميل</span>
+                            </a>
+                          ) : (
+                            <button
+                              type="button"
+                              disabled={downloadingItemId === job.id}
+                              onClick={() =>
+                                handleAuthenticatedProxyDownload(
+                                  `/api/direct-download/${encodeURIComponent(job.fileName)}?jobId=${encodeURIComponent(
+                                    job.id
+                                  )}${personalEmail ? `&userEmail=${encodeURIComponent(personalEmail)}` : ''}${
+                                    personalChatId ? `&chatId=${encodeURIComponent(personalChatId)}` : ''
+                                  }`,
+                                  job.fileName,
+                                  job.id
+                                )
+                              }
+                              className="text-indigo-400 hover:text-indigo-300 font-semibold flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                            >
+                              {downloadingItemId === job.id ? (
+                                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                              ) : (
+                                <Download className="w-3.5 h-3.5" />
+                              )}
+                              <span>تحميل</span>
+                            </button>
+                          ))}
                         {job.webViewLink && (
                           <a
                             href={job.webViewLink}
@@ -1301,7 +1398,7 @@ export default function App() {
                     </div>
 
                     {job.errorMessage && (
-                      <p className="text-xs text-rose-400 bg-rose-950/30 border border-rose-500/20 rounded-lg px-3 py-1.5">
+                      <p className="text-xs text-rose-400 bg-rose-950/30 border border-rose-500/20 rounded-lg px-3 py-1.5 break-words">
                         {job.errorMessage}
                       </p>
                     )}
@@ -1314,7 +1411,7 @@ export default function App() {
       </main>
 
       {/* =====================================================================
-          POPUP MODALS (جميع القوائم والخيارات مخفية في صفحات منبثقة)
+          POPUP MENU & POPUP PAGES (القائمة المنبثقة وكل خيار تنبثق منه صفحته)
          ===================================================================== */}
       {activeModal && (
         <div
@@ -1322,18 +1419,26 @@ export default function App() {
           onClick={() => setActiveModal(null)}
         >
           <div
-            className="bg-[#0D1322] border border-slate-800 rounded-2xl w-full max-w-3xl max-h-[88vh] flex flex-col shadow-2xl overflow-hidden"
+            className={`bg-[#0D1322] border border-slate-800 rounded-2xl w-full ${
+              activeModal === 'menu' ? 'max-w-md' : 'max-w-2xl'
+            } max-h-[88vh] flex flex-col shadow-2xl overflow-hidden`}
             onClick={(e) => e.stopPropagation()}
           >
-            {/* Modal Header */}
-            <div className="px-5 py-4 border-b border-slate-800 flex items-center justify-between gap-3 shrink-0">
-              <div className="flex items-center gap-2.5">
-                {activeModal === 'drive_files' && <HardDrive className="w-5 h-5 text-sky-400" />}
-                {activeModal === 'large_upload' && <UploadCloud className="w-5 h-5 text-indigo-400" />}
-                {activeModal === 'settings' && <Settings className="w-5 h-5 text-emerald-400" />}
-                {activeModal === 'admin' && <ShieldAlert className="w-5 h-5 text-amber-400" />}
-                {activeModal === 'url_options' && <Sliders className="w-5 h-5 text-sky-400" />}
-                <h2 className="text-base font-bold text-white">
+            {/* Modal Header with Back-to-Menu & Close */}
+            <div className="px-4 sm:px-5 py-3.5 border-b border-slate-800 flex items-center justify-between gap-2 shrink-0">
+              <div className="flex items-center gap-2 min-w-0">
+                {activeModal !== 'menu' && activeModal !== 'url_options' && (
+                  <button
+                    type="button"
+                    onClick={() => setActiveModal('menu')}
+                    className="px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 text-xs font-medium flex items-center gap-1 cursor-pointer shrink-0"
+                  >
+                    <ArrowRight className="w-3.5 h-3.5" />
+                    <span>القائمة</span>
+                  </button>
+                )}
+                <h2 className="text-sm sm:text-base font-bold text-white truncate">
+                  {activeModal === 'menu' && 'قائمة الخيارات والبوابات المنبثقة'}
                   {activeModal === 'drive_files' && 'ملفاتي ومجلداتي في Google Drive'}
                   {activeModal === 'large_upload' && 'رفع الملفات الضخمة مباشرة'}
                   {activeModal === 'settings' && 'حسابي الشخصي وإعدادات الربط'}
@@ -1344,7 +1449,7 @@ export default function App() {
 
               <button
                 onClick={() => setActiveModal(null)}
-                className="p-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white transition cursor-pointer"
+                className="p-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white transition cursor-pointer shrink-0"
                 aria-label="إغلاق النافذة"
               >
                 <X className="w-4 h-4" />
@@ -1352,7 +1457,101 @@ export default function App() {
             </div>
 
             {/* Modal Body */}
-            <div className="p-5 overflow-y-auto space-y-5 flex-1">
+            <div className="p-4 sm:p-5 overflow-y-auto space-y-4 flex-1">
+              {/* POPUP 0: THE TOP MENU LAUNCHER (كل خيار تنبثق منه صفحته) */}
+              {activeModal === 'menu' && (
+                <div className="space-y-2.5">
+                  <p className="text-xs text-slate-400 mb-3">
+                    اختر أي قسم لفتح صفحته المنبثقة الخاصة:
+                  </p>
+
+                  {/* Option 1: Personal Account & Link Settings */}
+                  <button
+                    type="button"
+                    onClick={() => setActiveModal('settings')}
+                    className="w-full p-3.5 rounded-xl bg-slate-900/80 hover:bg-slate-800/90 border border-slate-800 flex items-center justify-between gap-3 text-right transition cursor-pointer"
+                  >
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="w-10 h-10 rounded-xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400 shrink-0">
+                        <User className="w-5 h-5" />
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-sm font-bold text-white">حسابي الشخصي وإعدادات الربط</p>
+                        <p className="text-xs text-slate-400 truncate mt-0.5">
+                          {driveConnected
+                            ? `متصل: ${effectiveUserEmail || effectiveUserName}`
+                            : 'ربط حساب Google Drive ومحادثة تليجرام والخيارات'}
+                        </p>
+                      </div>
+                    </div>
+                    <ChevronLeft className="w-4 h-4 text-slate-500 shrink-0" />
+                  </button>
+
+                  {/* Option 2: Drive Files & Folders */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setActiveModal('drive_files');
+                      if (accessToken) refreshDriveFoldersAndFiles();
+                    }}
+                    className="w-full p-3.5 rounded-xl bg-slate-900/80 hover:bg-slate-800/90 border border-slate-800 flex items-center justify-between gap-3 text-right transition cursor-pointer"
+                  >
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="w-10 h-10 rounded-xl bg-sky-500/15 border border-sky-500/30 flex items-center justify-center text-sky-400 shrink-0">
+                        <HardDrive className="w-5 h-5" />
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-sm font-bold text-white">ملفاتي ومجلداتي في Google Drive</p>
+                        <p className="text-xs text-slate-400 truncate mt-0.5">
+                          اختيار أو إنشاء مجلد الحفظ وتصفح ملفاتك وإرسالها لتليجرام
+                        </p>
+                      </div>
+                    </div>
+                    <ChevronLeft className="w-4 h-4 text-slate-500 shrink-0" />
+                  </button>
+
+                  {/* Option 3: Large Local File Upload */}
+                  <button
+                    type="button"
+                    onClick={() => setActiveModal('large_upload')}
+                    className="w-full p-3.5 rounded-xl bg-slate-900/80 hover:bg-slate-800/90 border border-slate-800 flex items-center justify-between gap-3 text-right transition cursor-pointer"
+                  >
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="w-10 h-10 rounded-xl bg-indigo-500/15 border border-indigo-500/30 flex items-center justify-center text-indigo-400 shrink-0">
+                        <UploadCloud className="w-5 h-5" />
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-sm font-bold text-white">رفع الملفات الضخمة مباشرة</p>
+                        <p className="text-xs text-slate-400 truncate mt-0.5">
+                          رفع مباشر مقسم من جهازك إلى Google Drive لأي حجم (1GB+)
+                        </p>
+                      </div>
+                    </div>
+                    <ChevronLeft className="w-4 h-4 text-slate-500 shrink-0" />
+                  </button>
+
+                  {/* Option 4: Bot Admin & Vercel Webhook */}
+                  <button
+                    type="button"
+                    onClick={() => setActiveModal('admin')}
+                    className="w-full p-3.5 rounded-xl bg-slate-900/80 hover:bg-slate-800/90 border border-slate-800 flex items-center justify-between gap-3 text-right transition cursor-pointer"
+                  >
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="w-10 h-10 rounded-xl bg-amber-500/15 border border-amber-500/30 flex items-center justify-center text-amber-400 shrink-0">
+                        <ShieldAlert className="w-5 h-5" />
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-sm font-bold text-white">إدارة البوت وتشغيل Vercel</p>
+                        <p className="text-xs text-slate-400 truncate mt-0.5">
+                          تفعيل Webhook لـ Vercel، التحكم بالبوت، وإدارة المستخدمين
+                        </p>
+                      </div>
+                    </div>
+                    <ChevronLeft className="w-4 h-4 text-slate-500 shrink-0" />
+                  </button>
+                </div>
+              )}
+
               {/* MODAL 1: URL EXTRACTION OPTIONS */}
               {activeModal === 'url_options' && (
                 <div className="space-y-4">
@@ -1489,18 +1688,18 @@ export default function App() {
                             <span>المجلد النشط للحفظ: {selectedFolderName}</span>
                           </span>
 
-                          <form onSubmit={handleCreateNewFolder} className="flex items-center gap-2">
+                          <form onSubmit={handleCreateNewFolder} className="flex items-center gap-2 w-full sm:w-auto">
                             <input
                               type="text"
                               value={newFolderInput}
                               onChange={(e) => setNewFolderInput(e.target.value)}
                               placeholder="اسم مجلد جديد..."
-                              className="px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-white placeholder-slate-500"
+                              className="flex-1 px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-white placeholder-slate-500"
                             />
                             <button
                               type="submit"
                               disabled={creatingFolder || !newFolderInput.trim()}
-                              className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-semibold text-xs flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                              className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-semibold text-xs flex items-center gap-1 cursor-pointer shrink-0"
                             >
                               {creatingFolder ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FolderPlus className="w-3.5 h-3.5" />}
                               <span>إنشاء</span>
@@ -1594,16 +1793,29 @@ export default function App() {
                                     <span>لتليجرام</span>
                                   </button>
 
-                                  <a
-                                    href={`/api/direct-download?driveFileId=${encodeURIComponent(file.id)}${
-                                      personalEmail ? `&userEmail=${encodeURIComponent(personalEmail)}` : ''
-                                    }${personalChatId ? `&chatId=${encodeURIComponent(personalChatId)}` : ''}`}
-                                    download={file.name}
-                                    className="px-2.5 py-1 rounded-lg bg-indigo-500/15 hover:bg-indigo-500/25 text-indigo-300 font-semibold flex items-center gap-1"
+                                  <button
+                                    type="button"
+                                    disabled={downloadingItemId === file.id}
+                                    onClick={() =>
+                                      handleAuthenticatedProxyDownload(
+                                        `/api/direct-download/${encodeURIComponent(
+                                          file.name
+                                        )}?driveFileId=${encodeURIComponent(file.id)}${
+                                          personalEmail ? `&userEmail=${encodeURIComponent(personalEmail)}` : ''
+                                        }${personalChatId ? `&chatId=${encodeURIComponent(personalChatId)}` : ''}`,
+                                        file.name,
+                                        file.id
+                                      )
+                                    }
+                                    className="px-2.5 py-1 rounded-lg bg-indigo-500/15 hover:bg-indigo-500/25 text-indigo-300 font-semibold flex items-center gap-1 cursor-pointer disabled:opacity-50"
                                   >
-                                    <Download className="w-3 h-3" />
+                                    {downloadingItemId === file.id ? (
+                                      <Loader2 className="w-3 h-3 animate-spin" />
+                                    ) : (
+                                      <Download className="w-3 h-3" />
+                                    )}
                                     <span>تحميل</span>
-                                  </a>
+                                  </button>
 
                                   <button
                                     onClick={() => copyLink(file.id, file.webViewLink)}
@@ -1661,7 +1873,7 @@ export default function App() {
                       </button>
                     </div>
                   ) : (
-                    <label className="block border-2 border-dashed border-slate-700 hover:border-indigo-500/60 rounded-2xl p-10 text-center cursor-pointer transition bg-slate-900/40">
+                    <label className="block border-2 border-dashed border-slate-700 hover:border-indigo-500/60 rounded-2xl p-8 sm:p-10 text-center cursor-pointer transition bg-slate-900/40">
                       <input
                         type="file"
                         className="hidden"
@@ -1708,7 +1920,7 @@ export default function App() {
                         انسخ النطاق أدناه وأضفه في لوحة تحكم Firebase (Authentication → Settings → Authorized domains) ليعمل الدخول بضغطة زر على هذا النطاق:
                       </p>
                       <div className="flex items-center justify-between gap-2 p-2 rounded-lg bg-slate-950 border border-amber-500/30">
-                        <code className="text-amber-300 font-mono" dir="ltr">
+                        <code className="text-amber-300 font-mono truncate" dir="ltr">
                           {unauthorizedDomainHost}
                         </code>
                         <button
@@ -1717,7 +1929,7 @@ export default function App() {
                             setCopiedDomain(true);
                             setTimeout(() => setCopiedDomain(false), 2000);
                           }}
-                          className="px-2.5 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 font-semibold cursor-pointer"
+                          className="px-2.5 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 font-semibold cursor-pointer shrink-0"
                         >
                           {copiedDomain ? 'تم النسخ' : 'نسخ النطاق'}
                         </button>
@@ -1876,19 +2088,17 @@ export default function App() {
                     <label className="block text-xs font-semibold text-slate-300">
                       معرف عميل Google OAuth مخصص لـ Vercel (اختياري - Client ID)
                     </label>
-                    <div className="flex flex-col sm:flex-row gap-2">
-                      <input
-                        type="text"
-                        dir="ltr"
-                        value={customClientId}
-                        onChange={(e) => {
-                          setCustomClientId(e.target.value);
-                          localStorage.setItem(STORAGE_CUSTOM_CLIENT_ID_KEY, e.target.value.trim());
-                        }}
-                        placeholder="xxxx.apps.googleusercontent.com (اتركه فارغاً للافتراضي)"
-                        className="flex-1 px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-white placeholder-slate-500"
-                      />
-                    </div>
+                    <input
+                      type="text"
+                      dir="ltr"
+                      value={customClientId}
+                      onChange={(e) => {
+                        setCustomClientId(e.target.value);
+                        localStorage.setItem(STORAGE_CUSTOM_CLIENT_ID_KEY, e.target.value.trim());
+                      }}
+                      placeholder="xxxx.apps.googleusercontent.com (اتركه فارغاً للافتراضي)"
+                      className="w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-white placeholder-slate-500"
+                    />
                   </div>
 
                   {(personalEmail || personalChatId) && (

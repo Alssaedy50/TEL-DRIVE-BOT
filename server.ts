@@ -40,7 +40,7 @@ export type CompressMode = 'none' | 'zip' | 'media';
 export interface TransferJob {
   id: string;
   source: 'telegram' | 'url' | 'web' | 'drive_to_telegram' | 'url_to_telegram';
-  direction?: 'to_drive' | 'to_telegram';
+  direction?: 'to_drive' | 'to_telegram' | 'to_device';
   protocol?: 'bot_api' | 'mtproto' | 'http';
   mediaFormat?: 'video' | 'audio';
   quality?: string;
@@ -1638,10 +1638,48 @@ function decodeSaveTubePayload(encodedBase64: string): any {
   return JSON.parse(decrypted.toString('utf8'));
 }
 
+function extractCleanHttpUrl(rawInput: string): string {
+  const trimmed = (rawInput || '').trim();
+  const match = trimmed.match(/https?:\/\/[^\s"'<>]+/i);
+  return match ? match[0] : trimmed;
+}
+
 function extractYouTubeId(urlStr: string): string | null {
+  const clean = extractCleanHttpUrl(urlStr);
+  try {
+    const withProto = /^https?:\/\//i.test(clean) ? clean : `https://${clean}`;
+    const parsed = new URL(withProto);
+    const host = parsed.hostname.toLowerCase();
+
+    if (host === 'youtu.be' || host.endsWith('.youtu.be')) {
+      const seg = parsed.pathname.split('/').filter(Boolean)[0];
+      if (seg && /^[a-zA-Z0-9_-]{11}$/.test(seg)) {
+        return seg;
+      }
+    }
+
+    if (host.includes('youtube.com') || host.includes('youtube-nocookie.com')) {
+      const vParam = parsed.searchParams.get('v') || parsed.searchParams.get('vi');
+      if (vParam && /^[a-zA-Z0-9_-]{11}$/.test(vParam)) {
+        return vParam;
+      }
+      const pathMatch = parsed.pathname.match(
+        /\/(?:shorts|live|embed|v|e|watch|reels)\/([a-zA-Z0-9_-]{11})/i
+      );
+      if (pathMatch && pathMatch[1]) {
+        return pathMatch[1];
+      }
+    }
+  } catch {
+    // Fallback to regex below
+  }
+
+  const vQueryMatch = clean.match(/[?&]v=([a-zA-Z0-9_-]{11})/i);
+  if (vQueryMatch && vQueryMatch[1]) return vQueryMatch[1];
+
   const regex =
-    /(?:https?:\/\/)?(?:www\.|m\.)?(?:youtube\.com\/(?:[^/\n\s]+\/\S+\/|v\/|embed\/|live\/|shorts\/|user\/[^/\n\s]+\/)?(?:watch\?v=|v%3D|embed%2F|video%2F)?|youtu\.be\/)([a-zA-Z0-9_-]{11})/i;
-  const match = urlStr.match(regex);
+    /(?:youtube\.com\/(?:shorts\/|live\/|embed\/|v\/|watch\?v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})/i;
+  const match = clean.match(regex);
   return match ? match[1] : null;
 }
 
@@ -1661,8 +1699,9 @@ export function detectVideoPlatform(rawUrl: string): {
   isTikTok: boolean;
 } {
   try {
-    const host = new URL(rawUrl).hostname.toLowerCase();
-    if (host.includes('youtube.com') || host === 'youtu.be') {
+    const clean = extractCleanHttpUrl(rawUrl);
+    const host = new URL(clean).hostname.toLowerCase();
+    if (host.includes('youtube.com') || host === 'youtu.be' || host.endsWith('.youtu.be')) {
       return { isVideoPlatform: true, platformName: 'YouTube (يوتيوب)', isYouTube: true, isTikTok: false };
     }
     if (host.includes('tiktok.com')) {
@@ -1691,6 +1730,7 @@ async function resolveYouTubeStream(
   resolvedUrl: string;
   detectedFileName: string;
   detectedMimeType: string;
+  customHeaders?: Record<string, string>;
 }> {
   const videoId = extractYouTubeId(rawUrl);
   if (!videoId) {
@@ -1701,11 +1741,11 @@ async function resolveYouTubeStream(
   const ua =
     'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36';
 
-  const defaultAudioQualities = ['320', '256', '128', '92'];
+  const defaultAudioQualities = ['320', '192', '128', '256', '92'];
   const defaultVideoQualities = ['720', '480', '360', '1080', '240', '144'];
   const baseOrder = format === 'audio' ? defaultAudioQualities : defaultVideoQualities;
   const cleanPref = (preferredQuality || '').replace(/[^0-9]/g, '');
-  const qualitiesToTry = cleanPref
+  const initialQualities = cleanPref
     ? [cleanPref, ...baseOrder.filter((q) => q !== cleanPref)]
     : baseOrder;
 
@@ -1742,7 +1782,21 @@ async function resolveYouTubeStream(
       const decoded = decodeSaveTubePayload(infoJson.data);
       const safeTitle = sanitizeMediaTitle(decoded.title, `YouTube_${videoId}`);
 
-      for (const q of qualitiesToTry) {
+      const advertisedQualities: string[] = [];
+      if (format === 'audio' && Array.isArray(decoded.audio_formats)) {
+        for (const af of decoded.audio_formats) {
+          if (af?.quality) advertisedQualities.push(String(af.quality));
+        }
+      } else if (format === 'video' && Array.isArray(decoded.video_formats)) {
+        for (const vf of decoded.video_formats) {
+          if (vf?.quality) advertisedQualities.push(String(vf.quality));
+          else if (vf?.height) advertisedQualities.push(String(vf.height));
+        }
+      }
+
+      const uniqueQualities = Array.from(new Set([...initialQualities, ...advertisedQualities]));
+
+      for (const q of uniqueQualities) {
         const dlRes = await fetch(`https://${cdn}/download`, {
           method: 'POST',
           headers: {
@@ -1760,18 +1814,30 @@ async function resolveYouTubeStream(
 
         const dlJson = await dlRes.json();
         const downloadUrl = dlJson?.data?.downloadUrl;
-        if (downloadUrl) {
+        if (downloadUrl && typeof downloadUrl === 'string' && downloadUrl.startsWith('http')) {
           const isAudio = format === 'audio';
+          const badge = cleanPref || q;
           return {
             resolvedUrl: downloadUrl,
-            detectedFileName: isAudio ? `${safeTitle} (${q}kbps).mp3` : `${safeTitle} (${q}p).mp4`,
+            detectedFileName: isAudio ? `${safeTitle} (${badge}kbps).mp3` : `${safeTitle} (${badge}p).mp4`,
             detectedMimeType: isAudio ? 'audio/mpeg' : 'video/mp4',
+            customHeaders: {
+              'User-Agent': ua,
+              Referer: 'https://save-tube.com/',
+            },
           };
         }
       }
     } catch (err: any) {
       lastError = err?.message || 'خطأ في استخراج فيديو يوتيوب';
     }
+  }
+
+  // Fallback to standalone yt-dlp binary if SaveTube fails
+  try {
+    return await resolveWithYtDlpBinary(normalizedYtUrl, format, preferredQuality);
+  } catch (ytDlpErr: any) {
+    console.warn('yt-dlp fallback failed for YouTube URL:', ytDlpErr?.message);
   }
 
   throw new Error(`تعذر سحب فيديو يوتيوب حالياً (${lastError}). تأكد من أن الفيديو عام وليس خاصاً.`);
@@ -1904,19 +1970,20 @@ async function resolveTelegramPostLinkIfApplicable(
   detectedMimeType?: string;
   customHeaders?: Record<string, string>;
 }> {
+  const cleanedInputUrl = extractCleanHttpUrl(rawUrl);
   try {
-    const parsed = new URL(rawUrl);
+    const parsed = new URL(cleanedInputUrl);
     const host = parsed.hostname.toLowerCase();
     const effectiveQuality = preferredQuality || adminConfig.defaultQuality || '720';
 
-    // 0A. YouTube Links (watch, shorts, youtu.be, live)
-    if (host.includes('youtube.com') || host === 'youtu.be') {
-      return await resolveYouTubeStream(rawUrl, mediaFormat, effectiveQuality);
+    // 0A. YouTube Links (watch, shorts, youtu.be, live, music.youtube.com)
+    if (host.includes('youtube.com') || host === 'youtu.be' || host.endsWith('.youtu.be')) {
+      return await resolveYouTubeStream(cleanedInputUrl, mediaFormat, effectiveQuality);
     }
 
     // 0B. TikTok Links (tiktok.com, vm.tiktok.com, vt.tiktok.com)
     if (host.includes('tiktok.com')) {
-      return await resolveTikTokStream(rawUrl, mediaFormat, effectiveQuality);
+      return await resolveTikTokStream(cleanedInputUrl, mediaFormat, effectiveQuality);
     }
 
     // 0C. Other Social Video Links (Instagram, Facebook, X/Twitter) via yt-dlp
@@ -1927,7 +1994,7 @@ async function resolveTelegramPostLinkIfApplicable(
       host.includes('twitter.com') ||
       host.includes('x.com')
     ) {
-      return await resolveWithYtDlpBinary(rawUrl, mediaFormat, effectiveQuality);
+      return await resolveWithYtDlpBinary(cleanedInputUrl, mediaFormat, effectiveQuality);
     }
 
     // 1. Dropbox shared links -> force direct download (dl=1)
@@ -3039,6 +3106,13 @@ async function executeTransferJob(job: TransferJob): Promise<void> {
       }
 
       const contentTypeHeader = sourceRes.headers.get('content-type');
+      if (
+        contentTypeHeader &&
+        contentTypeHeader.toLowerCase().includes('text/html') &&
+        !job.fileName.toLowerCase().endsWith('.html')
+      ) {
+        throw new Error('المصدر أعاد صفحة ويب (HTML) بدلاً من ملف الفيديو/الصوت المباشر. تأكد من صلاحية الرابط.');
+      }
       if (contentTypeHeader && job.mimeType === 'application/octet-stream') {
         job.mimeType = contentTypeHeader.split(';')[0].trim();
       }
@@ -3481,6 +3555,15 @@ async function executePullToTelegramJob(job: TransferJob): Promise<void> {
 
       if (!sourceRes.ok || !sourceRes.body) {
         throw new Error(`فشل الاتصال بمصدر الرابط (${sourceRes.status} ${sourceRes.statusText})`);
+      }
+
+      const contentTypeHeader = sourceRes.headers.get('content-type');
+      if (
+        contentTypeHeader &&
+        contentTypeHeader.toLowerCase().includes('text/html') &&
+        !job.fileName.toLowerCase().endsWith('.html')
+      ) {
+        throw new Error('المصدر أعاد صفحة ويب (HTML) بدلاً من ملف الفيديو/الصوت المباشر. تأكد من صلاحية الرابط.');
       }
 
       const contentLengthHeader = sourceRes.headers.get('content-length');
@@ -5750,10 +5833,152 @@ app.post('/api/admin/settings', (req, res) => {
   res.json({ ok: true, admin: adminConfig, drive: prof });
 });
 
-// Direct Browser Download Endpoint (Download Video, Audio, or File Directly to Device)
-app.get('/api/direct-download', async (req, res) => {
+// Resolve Direct Browser Download via JSON (Prevents direct-download.html & records job in history)
+app.post('/api/transfers/resolve-direct', async (req, res) => {
   const ctx = resolveRequestUserContext(req);
-  const rawUrl = typeof req.query.url === 'string' ? req.query.url.trim() : '';
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    ctx.profile.accessToken = authHeader.replace('Bearer ', '').trim();
+  }
+
+  const { url, customFileName, mediaFormat, quality, compressMode } = req.body || {};
+  const cleanUrl = extractCleanHttpUrl(typeof url === 'string' ? url : '');
+  if (!cleanUrl || !/^https?:\/\//i.test(cleanUrl)) {
+    res.status(400).json({ error: 'يرجى إدخال رابط صالح يبدأ بـ http:// أو https://' });
+    return;
+  }
+
+  const resolvedFormat: 'video' | 'audio' = mediaFormat === 'audio' ? 'audio' : 'video';
+  const resolvedQuality =
+    typeof quality === 'string' && quality.trim() ? quality.trim() : ctx.session.defaultQuality || '720';
+  const resolvedCompress: CompressMode =
+    compressMode === 'zip' || compressMode === 'media' || compressMode === 'none'
+      ? compressMode
+      : 'none';
+
+  try {
+    const resolved = await resolveTelegramPostLinkIfApplicable(cleanUrl, resolvedFormat, resolvedQuality);
+    let fileName = (typeof customFileName === 'string' ? customFileName.trim() : '') || '';
+    if (!fileName) {
+      fileName = resolved.detectedFileName || extractFilenameFromUrl(cleanUrl, resolvedFormat);
+    } else if (!fileName.includes('.')) {
+      const extMatch = (resolved.detectedFileName || '').match(/(\.[^.]+)$/);
+      fileName += extMatch ? extMatch[1] : resolvedFormat === 'audio' ? '.mp3' : '.mp4';
+    }
+
+    let mimeType =
+      resolved.detectedMimeType || (resolvedFormat === 'audio' ? 'audio/mpeg' : 'video/mp4');
+    let totalBytes = 0;
+
+    // Probe the resolved stream to verify it is not an HTML error page and obtain its size
+    const probeController = new AbortController();
+    const probeTimeout = setTimeout(() => probeController.abort(), 12000);
+    try {
+      const probeRes = await fetch(resolved.resolvedUrl, {
+        method: 'GET',
+        headers: {
+          Range: 'bytes=0-0',
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          ...(resolved.customHeaders || {}),
+        },
+        signal: probeController.signal,
+      });
+
+      const ct = (probeRes.headers.get('content-type') || '').toLowerCase();
+      if (!probeRes.ok && probeRes.status !== 206) {
+        await probeRes.body?.cancel().catch(() => {});
+        throw new Error(`المصدر رفض التحميل (${probeRes.status}).`);
+      }
+      if (ct.includes('text/html') && !fileName.toLowerCase().endsWith('.html')) {
+        await probeRes.body?.cancel().catch(() => {});
+        throw new Error('المصدر أعاد صفحة HTML بدلاً من ملف الفيديو أو الصوت.');
+      }
+
+      const contentRange = probeRes.headers.get('content-range');
+      const contentLen = probeRes.headers.get('content-length');
+      if (contentRange && contentRange.includes('/')) {
+        const totalPart = parseInt(contentRange.split('/')[1], 10);
+        if (!isNaN(totalPart) && totalPart > 0) totalBytes = totalPart;
+      } else if (contentLen) {
+        const parsedLen = parseInt(contentLen, 10);
+        if (!isNaN(parsedLen) && parsedLen > 1) totalBytes = parsedLen;
+      }
+
+      if (ct && !ct.includes('application/octet-stream')) {
+        mimeType = ct.split(';')[0].trim();
+      }
+      await probeRes.body?.cancel().catch(() => {});
+    } finally {
+      clearTimeout(probeTimeout);
+    }
+
+    const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const job: TransferJob = {
+      id: jobId,
+      source: 'url',
+      direction: 'to_device',
+      protocol: 'http',
+      mediaFormat: resolvedFormat,
+      quality: resolvedQuality,
+      compressMode: resolvedCompress,
+      fileName,
+      mimeType,
+      totalBytes,
+      bytesTransferred: totalBytes,
+      speedBps: 0,
+      status: 'completed',
+      senderName: ctx.session.userName || 'تحميل مباشر للجهاز',
+      accountEmail: ctx.session.userEmail || 'default',
+      chatId: ctx.chatId || undefined,
+      directUrl: resolved.resolvedUrl,
+      createdAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+    };
+
+    transferJobs.unshift(job);
+    saveStateToDisk();
+
+    const safePathName = encodeURIComponent(fileName);
+    const proxyParams = new URLSearchParams({
+      jobId: job.id,
+      format: resolvedFormat,
+      quality: resolvedQuality,
+      compress: resolvedCompress,
+      name: fileName,
+    });
+    if (ctx.userEmail) proxyParams.set('userEmail', ctx.userEmail);
+    if (ctx.chatId) proxyParams.set('chatId', String(ctx.chatId));
+    const proxyDownloadUrl = `/api/direct-download/${safePathName}?${proxyParams.toString()}`;
+
+    const isDirectAttachmentCdn =
+      resolvedCompress === 'none' &&
+      /^https:\/\//i.test(resolved.resolvedUrl) &&
+      (resolved.resolvedUrl.includes('savetube') ||
+        resolved.resolvedUrl.endsWith('.mp4') ||
+        resolved.resolvedUrl.endsWith('.mp3'));
+
+    res.json({
+      ok: true,
+      fileName,
+      mimeType,
+      totalBytes,
+      directStreamUrl: resolved.resolvedUrl,
+      preferDirectCdn: isDirectAttachmentCdn,
+      proxyDownloadUrl,
+      job,
+    });
+  } catch (err: any) {
+    res.status(400).json({
+      error: err?.message || 'تعذر استخراج رابط التحميل المباشر للفيديو أو الصوت.',
+    });
+  }
+});
+
+// Direct Browser Download Endpoint (Download Video, Audio, or File Directly to Device)
+app.get(['/api/direct-download', '/api/direct-download/:pathFileName'], async (req, res) => {
+  const ctx = resolveRequestUserContext(req);
+  const rawUrl = typeof req.query.url === 'string' ? extractCleanHttpUrl(req.query.url) : '';
   const driveFileId = typeof req.query.driveFileId === 'string' ? req.query.driveFileId.trim() : '';
   const jobId = typeof req.query.jobId === 'string' ? req.query.jobId.trim() : '';
   const formatParam: 'video' | 'audio' = req.query.format === 'audio' ? 'audio' : 'video';
@@ -5765,7 +5990,10 @@ app.get('/api/direct-download', async (req, res) => {
       : req.query.compress === 'media'
       ? 'media'
       : 'none';
-  const customName = typeof req.query.name === 'string' ? req.query.name.trim() : '';
+  const pathNameParam =
+    typeof req.params.pathFileName === 'string' ? req.params.pathFileName.trim() : '';
+  const customName =
+    (typeof req.query.name === 'string' ? req.query.name.trim() : '') || pathNameParam;
 
   const abortController = new AbortController();
   req.on('close', () => {
@@ -5800,7 +6028,7 @@ app.get('/api/direct-download', async (req, res) => {
     if (targetDriveId) {
       const token = jobSpecificToken || ctx.session.accessToken || driveSession.accessToken;
       if (!token) {
-        res.status(401).send('يرجى ربط أو تنشيط جلسة حسابك Google Drive من لوحة التحكم أولاً لتحميل هذا الملف.');
+        res.status(401).json({ error: 'يرجى ربط أو تنشيط جلسة حسابك Google Drive من لوحة التحكم أولاً لتحميل هذا الملف.' });
         return;
       }
       const metaRes = await fetch(
@@ -5811,7 +6039,7 @@ app.get('/api/direct-download', async (req, res) => {
         }
       );
       if (!metaRes.ok) {
-        res.status(metaRes.status).send('تعذر قراءة بيانات الملف من Google Drive.');
+        res.status(metaRes.status).json({ error: 'تعذر قراءة بيانات الملف من Google Drive.' });
         return;
       }
       const meta = await metaRes.json();
@@ -5850,16 +6078,24 @@ app.get('/api/direct-download', async (req, res) => {
         },
       });
     } else {
-      res.status(400).send('يرجى تمرير رابط صالح (url) أو معرف ملف (driveFileId).');
+      res.status(400).json({ error: 'يرجى تمرير رابط صالح (url) أو معرف ملف (driveFileId).' });
       return;
     }
 
     if (!upstreamRes || !upstreamRes.ok || !upstreamRes.body) {
-      res.status(502).send(`تعذر جلب الملف من المصدر (${upstreamRes?.status || 'خطأ'}).`);
+      res.status(502).json({ error: `تعذر جلب الملف من المصدر (${upstreamRes?.status || 'خطأ'}).` });
       return;
     }
 
     const upstreamContentType = upstreamRes.headers.get('content-type');
+    if (
+      upstreamContentType &&
+      upstreamContentType.toLowerCase().includes('text/html') &&
+      !fileName.toLowerCase().endsWith('.html')
+    ) {
+      res.status(502).json({ error: 'المصدر أعاد صفحة HTML بدلاً من ملف الفيديو أو الصوت.' });
+      return;
+    }
     if (upstreamContentType && mimeType === 'application/octet-stream') {
       mimeType = upstreamContentType.split(';')[0].trim();
     }
@@ -5935,7 +6171,7 @@ app.get('/api/direct-download', async (req, res) => {
     res.end();
   } catch (err: any) {
     if (!res.headersSent) {
-      res.status(500).send(err?.message || 'حدث خطأ أثناء التحميل المباشر للملف.');
+      res.status(500).json({ error: err?.message || 'حدث خطأ أثناء التحميل المباشر للملف.' });
     } else if (!res.writableEnded) {
       res.end();
     }
@@ -6035,12 +6271,12 @@ app.post('/api/transfers/url', async (req, res) => {
   }
 
   const { url, customFileName, destination, targetChatId, mediaFormat, quality, compressMode } = req.body || {};
-  if (!url || typeof url !== 'string' || !/^https?:\/\//i.test(url.trim())) {
+  const cleanUrl = extractCleanHttpUrl(typeof url === 'string' ? url : '');
+  if (!cleanUrl || !/^https?:\/\//i.test(cleanUrl)) {
     res.status(400).json({ error: 'يرجى إدخال رابط مباشر صالح يبدأ بـ http:// أو https://' });
     return;
   }
 
-  const cleanUrl = url.trim();
   const resolvedFormat: 'video' | 'audio' = mediaFormat === 'audio' ? 'audio' : 'video';
   const resolvedQuality =
     typeof quality === 'string' && quality.trim() ? quality.trim() : ctx.session.defaultQuality || '720';
