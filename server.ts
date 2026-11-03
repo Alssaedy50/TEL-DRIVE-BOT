@@ -24,6 +24,13 @@ let activeWebhookUrl: string | null = null;
 
 app.use(express.json({ limit: '50mb' }));
 app.use((req, res, next) => {
+  // Normalize req.url when rewritten by Vercel serverless /api/index
+  const matchedPath =
+    (req.headers['x-matched-path'] as string) ||
+    (req.headers['x-forwarded-uri'] as string);
+  if (matchedPath && matchedPath.startsWith('/api') && req.url !== matchedPath) {
+    req.url = matchedPath;
+  }
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -496,11 +503,14 @@ async function getSafeClientSender(client: TelegramClient, dcId: number): Promis
 }
 
 // Keep warm DC senders alive every 25s so GramJS's 60s timer never disconnects them
-setInterval(() => {
+const gramJsKeepAlive = setInterval(() => {
   for (const c of mtprotoPoolClients) {
     preventExportedSenderAutoDisconnect(c);
   }
 }, 25000);
+if (typeof gramJsKeepAlive.unref === 'function') {
+  gramJsKeepAlive.unref();
+}
 
 async function createAndConnectSingleMtprotoClient(
   savedSession: string,
@@ -5809,17 +5819,26 @@ app.post('/api/vercel/push-session', async (req, res) => {
   }
 
   let cleanOrigin = typeof vercelUrl === 'string' ? vercelUrl.trim().replace(/\/+$/, '') : '';
-  if (cleanOrigin && !/^https?:\/\//i.test(cleanOrigin)) {
-    cleanOrigin = `https://${cleanOrigin}`;
-  }
-  try {
-    if (cleanOrigin) {
-      const parsed = new URL(cleanOrigin);
-      cleanOrigin = parsed.origin;
+  if (cleanOrigin) {
+    if (cleanOrigin.toUpperCase().startsWith('TD1_') || cleanOrigin.includes('magicAuth=')) {
+      res.status(400).json({
+        error: 'القيمة المدخلة في خانة الرابط تبدو ككود جلسة (TD1_...) وليست رابط موقع. يرجى إدخال رابط موقع Vercel (مثال: https://your-app.vercel.app)',
+      });
+      return;
     }
-  } catch {
-    res.status(400).json({ error: 'يرجى إدخال رابط Vercel صالح (مثال: https://your-app.vercel.app).' });
-    return;
+    if (!/^https?:\/\//i.test(cleanOrigin)) {
+      cleanOrigin = `https://${cleanOrigin}`;
+    }
+    try {
+      const parsed = new URL(cleanOrigin);
+      if (!parsed.hostname.includes('.') || parsed.hostname.includes('_')) {
+        throw new Error('Invalid hostname');
+      }
+      cleanOrigin = parsed.origin;
+    } catch {
+      res.status(400).json({ error: 'يرجى إدخال رابط Vercel صالح (مثال: https://your-app.vercel.app).' });
+      return;
+    }
   }
 
   const payload = {
@@ -5891,20 +5910,35 @@ app.post('/api/vercel/push-session', async (req, res) => {
     ].filter(Boolean);
 
     const inlineKeyboard: any[][] = [];
-    if (magicLoginUrl && magicLoginUrl.startsWith('https://')) {
-      inlineKeyboard.push([
-        {
-          text: '🚀 فتح موقعك على Vercel بالحساب المربوط جاهزاً',
-          url: magicLoginUrl,
-        },
-      ]);
+    if (magicLoginUrl) {
+      try {
+        const testUrl = new URL(magicLoginUrl);
+        if (
+          (testUrl.protocol === 'https:' || testUrl.protocol === 'http:') &&
+          testUrl.hostname.includes('.') &&
+          !testUrl.hostname.includes('_')
+        ) {
+          inlineKeyboard.push([
+            {
+              text: '🚀 فتح موقعك على Vercel بالحساب المربوط جاهزاً',
+              url: magicLoginUrl,
+            },
+          ]);
+        }
+      } catch {
+        // Skip invalid button url
+      }
     }
-    await sendTelegramMessage(
-      targetChat,
-      msgLines.join('\n'),
-      undefined,
-      inlineKeyboard.length > 0 ? { inline_keyboard: inlineKeyboard } : undefined
-    ).catch(() => {});
+    try {
+      await sendTelegramMessage(
+        targetChat,
+        msgLines.join('\n'),
+        undefined,
+        inlineKeyboard.length > 0 ? { inline_keyboard: inlineKeyboard } : undefined
+      );
+    } catch (tgErr: any) {
+      console.warn('Telegram session message send failed:', tgErr?.message);
+    }
   }
 
   res.json({
@@ -6454,42 +6488,87 @@ app.post('/api/transfers/url', async (req, res) => {
     compressMode === 'zip' || compressMode === 'media' || compressMode === 'none'
       ? compressMode
       : ctx.session.defaultCompressMode || 'none';
-  const fileName = (customFileName || '').trim() || extractFilenameFromUrl(cleanUrl, resolvedFormat);
-  const isToTelegram = destination === 'telegram';
 
-  if (isToTelegram) {
-    const resolvedChatId =
-      Number(targetChatId) ||
-      ctx.chatId ||
-      ctx.profile.chatId ||
-      adminConfig.ownerChatId ||
-      Object.values(adminConfig.knownUsers)[0]?.chatId ||
-      transferJobs.find((j) => j.chatId)?.chatId;
+  try {
+    // Validate and resolve URL upfront to provide immediate feedback for unsupported link types (e.g. Telegram post links)
+    const resolvedMedia = await resolveTelegramPostLinkIfApplicable(cleanUrl, resolvedFormat, resolvedQuality);
+    const fileName =
+      (customFileName || '').trim() ||
+      resolvedMedia.detectedFileName ||
+      extractFilenameFromUrl(cleanUrl, resolvedFormat);
 
-    if (!resolvedChatId) {
-      res.status(400).json({
-        error:
-          'يرجى ربط حسابك في تليجرام أولاً عبر زر "ربط حسابي في تليجرام" لإرسال الرابط إلى محادثتك الخاصة.',
+    const isToTelegram = destination === 'telegram';
+
+    if (isToTelegram) {
+      const resolvedChatId =
+        Number(targetChatId) ||
+        ctx.chatId ||
+        ctx.profile.chatId ||
+        adminConfig.ownerChatId ||
+        Object.values(adminConfig.knownUsers)[0]?.chatId ||
+        transferJobs.find((j) => j.chatId)?.chatId;
+
+      if (!resolvedChatId) {
+        res.status(400).json({
+          error:
+            'يرجى ربط حسابك في تليجرام أولاً عبر زر "ربط حسابي في تليجرام" لإرسال الرابط إلى محادثتك الخاصة.',
+        });
+        return;
+      }
+
+      const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      let statusMsgId: number | undefined;
+      try {
+        statusMsgId = await sendTelegramMessage(
+          resolvedChatId,
+          `📥 <b>جاري سحب الرابط (${resolvedFormat === 'audio' ? `${resolvedQuality}kbps MP3` : `${resolvedQuality}p`})${
+            resolvedCompress !== 'none' ? ` مع الضغط (${formatCompressModeAr(resolvedCompress)})` : ''
+          } وإرساله إلى تليجرام...</b>\n📄 <code>${fileName}</code>`,
+          undefined,
+          {
+            inline_keyboard: [[{ text: '⛔ إلغاء السحب', callback_data: `cancel_${jobId}` }]],
+          }
+        );
+      } catch (tgErr: any) {
+        console.warn('Could not send initial Telegram status message:', tgErr?.message);
+      }
+
+      const job: TransferJob = {
+        id: jobId,
+        source: 'url_to_telegram',
+        direction: 'to_telegram',
+        protocol: 'http',
+        mediaFormat: resolvedFormat,
+        quality: resolvedQuality,
+        compressMode: resolvedCompress,
+        fileName,
+        mimeType: resolvedFormat === 'audio' ? 'audio/mpeg' : 'application/octet-stream',
+        totalBytes: 0,
+        bytesTransferred: 0,
+        speedBps: 0,
+        status: 'queued',
+        senderName: ctx.session.userName || 'لوحة التحكم (رابط إلى تليجرام)',
+        accountEmail: ctx.session.userEmail || 'default',
+        chatId: resolvedChatId,
+        statusMessageId: statusMsgId,
+        directUrl: resolvedMedia.resolvedUrl || cleanUrl,
+        createdAt: new Date().toISOString(),
+      };
+
+      transferJobs.unshift(job);
+      saveStateToDisk();
+      executePullToTelegramJob(job).catch((err) => {
+        console.error('executePullToTelegramJob error:', err?.message);
       });
+      res.json({ ok: true, job });
       return;
     }
 
-    const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const statusMsgId = await sendTelegramMessage(
-      resolvedChatId,
-      `📥 <b>جاري سحب الرابط (${resolvedFormat === 'audio' ? `${resolvedQuality}kbps MP3` : `${resolvedQuality}p`})${
-        resolvedCompress !== 'none' ? ` مع الضغط (${formatCompressModeAr(resolvedCompress)})` : ''
-      } وإرساله إلى تليجرام...</b>\n📄 <code>${fileName}</code>`,
-      undefined,
-      {
-        inline_keyboard: [[{ text: '⛔ إلغاء السحب', callback_data: `cancel_${jobId}` }]],
-      }
-    );
-
+    const canUpload = Boolean(ctx.session.accessToken && ctx.session.accountEnabled);
     const job: TransferJob = {
-      id: jobId,
-      source: 'url_to_telegram',
-      direction: 'to_telegram',
+      id: `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      source: 'url',
+      direction: 'to_drive',
       protocol: 'http',
       mediaFormat: resolvedFormat,
       quality: resolvedQuality,
@@ -6499,60 +6578,29 @@ app.post('/api/transfers/url', async (req, res) => {
       totalBytes: 0,
       bytesTransferred: 0,
       speedBps: 0,
-      status: 'queued',
-      senderName: ctx.session.userName || 'لوحة التحكم (رابط إلى تليجرام)',
+      status: canUpload ? 'queued' : 'waiting_auth',
+      senderName: ctx.session.userName || 'لوحة التحكم (رابط مباشر)',
       accountEmail: ctx.session.userEmail || 'default',
-      chatId: resolvedChatId,
-      statusMessageId: statusMsgId,
-      directUrl: cleanUrl,
+      chatId: ctx.chatId || undefined,
+      directUrl: resolvedMedia.resolvedUrl || cleanUrl,
+      folderName: ctx.session.activeFolderName,
       createdAt: new Date().toISOString(),
     };
 
     transferJobs.unshift(job);
     saveStateToDisk();
-    if (IS_VERCEL) {
-      await executePullToTelegramJob(job);
-    } else {
-      executePullToTelegramJob(job);
+    if (canUpload) {
+      executeTransferJob(job).catch((err) => {
+        console.error('executeTransferJob error:', err?.message);
+      });
     }
+
     res.json({ ok: true, job });
-    return;
+  } catch (err: any) {
+    res.status(400).json({
+      error: err?.message || 'تعذر معالجة الرابط المدخل. يرجى التأكد من صلاحية الرابط.',
+    });
   }
-
-  const canUpload = Boolean(ctx.session.accessToken && ctx.session.accountEnabled);
-  const job: TransferJob = {
-    id: `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-    source: 'url',
-    direction: 'to_drive',
-    protocol: 'http',
-    mediaFormat: resolvedFormat,
-    quality: resolvedQuality,
-    compressMode: resolvedCompress,
-    fileName,
-    mimeType: resolvedFormat === 'audio' ? 'audio/mpeg' : 'application/octet-stream',
-    totalBytes: 0,
-    bytesTransferred: 0,
-    speedBps: 0,
-    status: canUpload ? 'queued' : 'waiting_auth',
-    senderName: ctx.session.userName || 'لوحة التحكم (رابط مباشر)',
-    accountEmail: ctx.session.userEmail || 'default',
-    chatId: ctx.chatId || undefined,
-    directUrl: cleanUrl,
-    folderName: ctx.session.activeFolderName,
-    createdAt: new Date().toISOString(),
-  };
-
-  transferJobs.unshift(job);
-  saveStateToDisk();
-  if (canUpload) {
-    if (IS_VERCEL) {
-      await executeTransferJob(job);
-    } else {
-      executeTransferJob(job);
-    }
-  }
-
-  res.json({ ok: true, job });
 });
 
 app.post('/api/transfers/register-web', (req, res) => {

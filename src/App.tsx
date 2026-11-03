@@ -180,6 +180,30 @@ interface ServerStatus {
   jobs: TransferJob[];
 }
 
+async function parseJsonResponse<T = any>(res: Response, fallbackErrorMsg = 'تعذر إتمام العملية'): Promise<T> {
+  const text = await res.text();
+  let json: any = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    if (res.status === 500 || text.includes('A server error has occurred')) {
+      throw new Error('حدث خطأ في خادم Vercel (500). يرجى التأكد من نشر أحدث التعديلات وإعادة المحاولة.');
+    }
+    if (res.status === 504) {
+      throw new Error('انتهت مهلة استجابة الخادم (504 Gateway Timeout). حاول مرة أخرى.');
+    }
+    if (res.status === 404) {
+      throw new Error('مسار الخدمة المطلوب غير متاح على الخادم (404).');
+    }
+    throw new Error(`تعذر قراءة استجابة الخادم (${res.status}): ${text.slice(0, 80)}`);
+  }
+
+  if (!res.ok) {
+    throw new Error(json?.error || fallbackErrorMsg);
+  }
+  return json as T;
+}
+
 export default function App() {
   // Personal Identity State (Multi-User Personal Account Support)
   const [personalEmail, setPersonalEmail] = useState<string>(() => {
@@ -422,10 +446,7 @@ export default function App() {
         deduplicate: dedupOverride !== undefined ? dedupOverride : skipDuplicates,
       }),
     });
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.error || 'تعذر مزامنة جلسة حسابك مع الخادم.');
-    }
+    const data = await parseJsonResponse(res, 'تعذر مزامنة جلسة حسابك مع الخادم.');
     return data;
   };
 
@@ -551,8 +572,8 @@ export default function App() {
       const headers: Record<string, string> = {};
       if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
       const res = await fetch(`/api/drive/export-session${buildIdentityQuery()}`, { headers });
-      const data = await res.json();
-      if (!res.ok || !data.sessionCode) {
+      const data = await parseJsonResponse(res, 'تعذر استخراج كود الجلسة.');
+      if (!data.sessionCode) {
         throw new Error(data.error || 'تعذر استخراج كود الجلسة.');
       }
       await navigator.clipboard.writeText(data.sessionCode);
@@ -588,10 +609,7 @@ export default function App() {
           sendToTelegram: true,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'تعذر نقل الجلسة إلى Vercel.');
-      }
+      const data = await parseJsonResponse(res, 'تعذر نقل الجلسة إلى Vercel.');
       if (data.sessionCode) {
         await navigator.clipboard.writeText(data.sessionCode).catch(() => {});
       }
@@ -805,10 +823,7 @@ export default function App() {
             targetChatId: personalChatId || undefined,
           }),
         });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data.error || 'تعذر استخراج رابط التحميل المباشر.');
-        }
+        const data = await parseJsonResponse(res, 'تعذر استخراج رابط التحميل المباشر.');
 
         setExternalUrlInput('');
         setExternalCustomName('');
@@ -824,6 +839,7 @@ export default function App() {
           document.body.removeChild(a);
           setBannerSuccess(`تم تجهيز "${data.fileName}" وبدأ التحميل المباشر إلى جهازك!`);
         } else if (data.proxyDownloadUrl) {
+          setLastDirectDownload({ url: data.proxyDownloadUrl, fileName: data.fileName || 'download' });
           await handleAuthenticatedProxyDownload(
             data.proxyDownloadUrl,
             data.fileName || 'download',
@@ -857,10 +873,7 @@ export default function App() {
           targetChatId: personalChatId || undefined,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'تعذر إضافة الرابط للتحويل.');
-      }
+      const data = await parseJsonResponse(res, 'تعذر إضافة الرابط للتحويل.');
       setExternalUrlInput('');
       setExternalCustomName('');
       setBannerSuccess(
@@ -897,10 +910,7 @@ export default function App() {
           targetChatId: personalChatId || undefined,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'تعذر إرسال الملف إلى تليجرام.');
-      }
+      const data = await parseJsonResponse(res, 'تعذر إرسال الملف إلى تليجرام.');
       setBannerSuccess(`جاري سحب الملف "${file.name}" من حسابك في Google Drive وإرساله إلى تليجرام!`);
       setTimeout(() => setBannerSuccess(null), 4000);
       fetchStatus();
@@ -924,10 +934,7 @@ export default function App() {
           ...payload,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'تعذر حفظ الإعدادات.');
-      }
+      await parseJsonResponse(res, 'تعذر حفظ الإعدادات.');
       await fetchStatus();
       setBannerSuccess('تم حفظ وتطبيق الإعدادات بنجاح!');
       setTimeout(() => setBannerSuccess(null), 3000);
@@ -979,11 +986,9 @@ export default function App() {
     setClearingFailed(true);
     try {
       const res = await fetch(`/api/transfers/failed/clear${buildIdentityQuery()}`, { method: 'DELETE' });
-      const data = await res.json();
-      if (res.ok) {
-        setBannerSuccess(`تم حذف ${data.removedCount} من الملفات الفاشلة والملغاة من سجلك.`);
-        setTimeout(() => setBannerSuccess(null), 3500);
-      }
+      const data = await parseJsonResponse(res, 'تعذر تنظيف العمليات الفاشلة.');
+      setBannerSuccess(`تم حذف ${data.removedCount} من الملفات الفاشلة والملغاة من سجلك.`);
+      setTimeout(() => setBannerSuccess(null), 3500);
       fetchStatus();
     } catch {
       // Ignore
@@ -1067,10 +1072,7 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ origin: window.location.origin }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'تعذر تفعيل Webhook.');
-      }
+      const data = await parseJsonResponse(res, 'تعذر تفعيل Webhook.');
       setBannerSuccess(`تم تفعيل Webhook البوت بنجاح على الرابط: ${data.webhookUrl}`);
       setTimeout(() => setBannerSuccess(null), 5000);
       await fetchStatus();
@@ -1331,6 +1333,45 @@ export default function App() {
               </button>
             </div>
           </form>
+
+          {/* Direct Download Ready Action Card */}
+          {lastDirectDownload && (
+            <div className="mt-3.5 p-3.5 rounded-xl bg-indigo-950/40 border border-indigo-500/30 flex flex-col sm:flex-row items-center justify-between gap-3 text-right">
+              <div className="flex items-center gap-2.5 min-w-0 w-full sm:w-auto">
+                <div className="w-9 h-9 rounded-lg bg-indigo-500/20 border border-indigo-500/40 flex items-center justify-center text-indigo-400 shrink-0">
+                  <Download className="w-5 h-5" />
+                </div>
+                <div className="min-w-0">
+                  <p className="text-xs text-indigo-300 font-semibold">الملف جاهز للتحميل المباشر للجهاز:</p>
+                  <p className="text-sm font-bold text-white truncate">{lastDirectDownload.fileName}</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 w-full sm:w-auto shrink-0 justify-end">
+                <a
+                  href={lastDirectDownload.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  download={lastDirectDownload.fileName}
+                  className="flex-1 sm:flex-none px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow-md transition"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>تحميل الملف الآن</span>
+                </a>
+                <button
+                  type="button"
+                  onClick={() => {
+                    navigator.clipboard.writeText(lastDirectDownload.url);
+                    setBannerSuccess('تم نسخ رابط التحميل المباشر بنجاح!');
+                    setTimeout(() => setBannerSuccess(null), 3000);
+                  }}
+                  className="px-3 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 text-xs font-medium flex items-center justify-center gap-1 transition cursor-pointer"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                  <span>نسخ الرابط</span>
+                </button>
+              </div>
+            </div>
+          )}
         </section>
 
         {/* Core Card 2: Live Personal Transfer Queue & History */}
