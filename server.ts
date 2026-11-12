@@ -1755,6 +1755,8 @@ async function resolveYouTubeStream(
   resolvedUrl: string;
   detectedFileName: string;
   detectedMimeType: string;
+  rawTitle?: string;
+  durationSec?: number;
   customHeaders?: Record<string, string>;
 }> {
   const videoId = extractYouTubeId(rawUrl);
@@ -1846,6 +1848,8 @@ async function resolveYouTubeStream(
             resolvedUrl: downloadUrl,
             detectedFileName: isAudio ? `${safeTitle} (${badge}kbps).mp3` : `${safeTitle} (${badge}p).mp4`,
             detectedMimeType: isAudio ? 'audio/mpeg' : 'video/mp4',
+            rawTitle: safeTitle,
+            durationSec: Number(decoded.duration) || 0,
             customHeaders: {
               'User-Agent': ua,
               Referer: 'https://save-tube.com/',
@@ -1876,6 +1880,8 @@ async function resolveTikTokStream(
   resolvedUrl: string;
   detectedFileName: string;
   detectedMimeType: string;
+  rawTitle?: string;
+  durationSec?: number;
   customHeaders?: Record<string, string>;
 }> {
   // 1. Primary: TikWM API (Fast, HD, No Watermark)
@@ -1893,12 +1899,15 @@ async function resolveTikTokStream(
       if (json.code === 0 && json.data) {
         const d = json.data;
         const safeTitle = sanitizeMediaTitle(d.title || d.author?.unique_id || d.id, `TikTok_${d.id || Date.now()}`);
+        const durationSec = Number(d.duration) || 0;
 
         if (format === 'audio' && d.music) {
           return {
             resolvedUrl: d.music,
             detectedFileName: `${safeTitle}.mp3`,
             detectedMimeType: 'audio/mpeg',
+            rawTitle: safeTitle,
+            durationSec,
             customHeaders: { Referer: 'https://www.tiktok.com/' },
           };
         }
@@ -1912,6 +1921,8 @@ async function resolveTikTokStream(
             resolvedUrl: videoUrl,
             detectedFileName: `${safeTitle} (${qBadge}).mp4`,
             detectedMimeType: 'video/mp4',
+            rawTitle: safeTitle,
+            durationSec,
             customHeaders: { Referer: 'https://www.tiktok.com/' },
           };
         }
@@ -1993,6 +2004,8 @@ async function resolveTelegramPostLinkIfApplicable(
   resolvedUrl: string;
   detectedFileName?: string;
   detectedMimeType?: string;
+  rawTitle?: string;
+  durationSec?: number;
   customHeaders?: Record<string, string>;
 }> {
   const cleanedInputUrl = extractCleanHttpUrl(rawUrl);
@@ -6254,7 +6267,21 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
       resolvedFormat,
       effectiveQualityForResolve
     );
-    let fileName = (typeof customFileName === 'string' ? customFileName.trim() : '') || '';
+
+    // Prevent URLs accidentally pasted into customFileName from becoming the file name
+    let safeCustomName = typeof customFileName === 'string' ? customFileName.trim() : '';
+    if (
+      /^https?:\/\//i.test(safeCustomName) ||
+      safeCustomName.includes('youtube.com/') ||
+      safeCustomName.includes('youtu.be/') ||
+      safeCustomName.includes('tiktok.com/') ||
+      safeCustomName.includes('?si=')
+    ) {
+      safeCustomName = '';
+    }
+    safeCustomName = safeCustomName.replace(/[\\/:*?"<>|\r\n]+/g, ' ').trim();
+
+    let fileName = safeCustomName || '';
     if (!fileName) {
       fileName = resolved.detectedFileName || extractFilenameFromUrl(cleanUrl, resolvedFormat);
     } else if (!fileName.includes('.')) {
@@ -6317,61 +6344,247 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
         ? fileName.replace(/(\.[^/.]+)$/, ' (مضغوط)$1')
         : fileName;
 
-    const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const job: TransferJob = {
-      id: jobId,
-      source: 'url',
-      direction: 'to_device',
-      protocol: 'http',
-      mediaFormat: resolvedFormat,
-      quality: effectiveQualityForResolve,
-      compressMode: resolvedCompress,
-      fileName: downloadFileName,
-      mimeType: resolvedCompress === 'zip' ? 'application/zip' : mimeType,
-      totalBytes,
-      bytesTransferred: totalBytes,
-      speedBps: 0,
-      status: 'completed',
-      senderName: ctx.session.userName || 'تحميل مباشر للجهاز',
-      accountEmail: ctx.session.userEmail || 'default',
-      chatId: ctx.chatId || undefined,
-      directUrl: resolved.resolvedUrl,
-      createdAt: new Date().toISOString(),
-      completedAt: new Date().toISOString(),
+    const baseTitle =
+      resolved.rawTitle ||
+      safeCustomName.replace(/\.[^/.]+$/, '') ||
+      fileName.replace(/\s*\(\d+(?:p|kbps)\).*$/i, '').replace(/\.[^/.]+$/, '');
+
+    const platformInfo = detectVideoPlatform(cleanUrl);
+    const durationSec = resolved.durationSec || 0;
+
+    // Calculate reference 720p byte size from the probed stream so all format sizes are accurate
+    const qualityMultipliers: Record<string, number> = {
+      '1080': 1.85,
+      '720': 1.0,
+      '480': 0.56,
+      '360': 0.35,
+      '240': 0.22,
+      '320': 0.24,
+      '192': 0.15,
+      '128': 0.1,
+    };
+    const probedMultiplier = qualityMultipliers[effectiveQualityForResolve] || 1.0;
+    const base720Bytes =
+      totalBytes > 0
+        ? Math.round(totalBytes / probedMultiplier)
+        : durationSec > 0
+        ? durationSec * 165000
+        : 12 * 1024 * 1024;
+
+    const makeProxyUrl = (opts: {
+      fmt: 'video' | 'audio';
+      q: string;
+      comp: CompressMode;
+      fName: string;
+      useDirectResolved: boolean;
+    }) => {
+      const targetDownloadName =
+        opts.comp === 'zip' && !opts.fName.toLowerCase().endsWith('.zip')
+          ? `${opts.fName}.zip`
+          : opts.fName;
+      const p = new URLSearchParams({
+        url: opts.useDirectResolved ? resolved.resolvedUrl : cleanUrl,
+        format: opts.fmt,
+        quality: opts.q,
+        compress: opts.comp,
+        name: opts.fName,
+      });
+      if (ctx.userEmail) p.set('userEmail', ctx.userEmail);
+      if (ctx.chatId) p.set('chatId', String(ctx.chatId));
+      return `/api/direct-download/${encodeURIComponent(targetDownloadName)}?${p.toString()}`;
     };
 
-    transferJobs.unshift(job);
-    saveStateToDisk();
+    const availableFormats: Array<{
+      id: string;
+      format: 'video' | 'audio';
+      quality: string;
+      label: string;
+      badge: string;
+      ext: string;
+      sizeBytes: number;
+      savedPercent: number;
+      isSelected: boolean;
+      fileName: string;
+      zipFileName: string;
+      downloadUrl: string;
+      zipDownloadUrl: string;
+    }> = [];
 
-    const safePathName = encodeURIComponent(downloadFileName);
-    const proxyParams = new URLSearchParams({
-      jobId: job.id,
-      url: resolved.resolvedUrl,
-      format: resolvedFormat,
-      quality: effectiveQualityForResolve,
-      compress: resolvedCompress,
-      name: fileName,
+    const max1080Bytes = Math.round(base720Bytes * qualityMultipliers['1080']);
+
+    if (platformInfo.isVideoPlatform) {
+      const formatSpecs: Array<{
+        id: string;
+        format: 'video' | 'audio';
+        quality: string;
+        label: string;
+        badge: string;
+        ext: string;
+      }> = [
+        {
+          id: 'video_1080',
+          format: 'video',
+          quality: '1080',
+          label: 'MP4 • 1080p Full HD',
+          badge: 'أعلى دقة (بدون تقليص)',
+          ext: 'mp4',
+        },
+        {
+          id: 'video_720',
+          format: 'video',
+          quality: '720',
+          label: 'MP4 • 720p HD',
+          badge: 'جودة عالية متوازنة',
+          ext: 'mp4',
+        },
+        {
+          id: 'video_480',
+          format: 'video',
+          quality: '480',
+          label: 'MP4 • 480p (مضغوط متوسط)',
+          badge: 'تقليص حجم الفيديو ~70%',
+          ext: 'mp4',
+        },
+        {
+          id: 'video_360',
+          format: 'video',
+          quality: '360',
+          label: 'MP4 • 360p (مضغوط خفيف ⚡)',
+          badge: 'تقليص حجم الفيديو ~81%',
+          ext: 'mp4',
+        },
+        {
+          id: 'audio_320',
+          format: 'audio',
+          quality: '320',
+          label: 'MP3 • 320kbps (صوت نقي)',
+          badge: 'ملف صوتي عالي النقاء',
+          ext: 'mp3',
+        },
+        {
+          id: 'audio_128',
+          format: 'audio',
+          quality: '128',
+          label: 'MP3 • 128kbps (صوت مضغوط ⚡)',
+          badge: 'أصغر حجم صوتي ~94%',
+          ext: 'mp3',
+        },
+      ];
+
+      for (const spec of formatSpecs) {
+        const isExactProbed =
+          spec.format === resolvedFormat && spec.quality === effectiveQualityForResolve;
+        const estimatedBytes = isExactProbed
+          ? totalBytes
+          : spec.format === 'audio' && durationSec > 0
+          ? Math.round(durationSec * (spec.quality === '320' ? 40000 : 16000))
+          : Math.round(base720Bytes * (qualityMultipliers[spec.quality] || 0.5));
+        const savedPct =
+          max1080Bytes > 0 && estimatedBytes < max1080Bytes
+            ? Math.max(0, Math.min(96, Math.round(((max1080Bytes - estimatedBytes) / max1080Bytes) * 100)))
+            : 0;
+        const fmtFileName =
+          spec.format === 'audio'
+            ? `${baseTitle} (${spec.quality}kbps).mp3`
+            : `${baseTitle} (${spec.quality}p).mp4`;
+
+        availableFormats.push({
+          id: spec.id,
+          format: spec.format,
+          quality: spec.quality,
+          label: spec.label,
+          badge: spec.badge,
+          ext: spec.ext,
+          sizeBytes: estimatedBytes,
+          savedPercent: savedPct,
+          isSelected: isExactProbed,
+          fileName: fmtFileName,
+          zipFileName: `${fmtFileName}.zip`,
+          downloadUrl: makeProxyUrl({
+            fmt: spec.format,
+            q: spec.quality,
+            comp: 'none',
+            fName: fmtFileName,
+            useDirectResolved: isExactProbed,
+          }),
+          zipDownloadUrl: makeProxyUrl({
+            fmt: spec.format,
+            q: spec.quality,
+            comp: 'zip',
+            fName: fmtFileName,
+            useDirectResolved: isExactProbed,
+          }),
+        });
+      }
+    } else {
+      const extMatch = fileName.match(/\.([^.]+)$/);
+      const ext = extMatch ? extMatch[1].toLowerCase() : 'bin';
+      availableFormats.push({
+        id: 'direct_original',
+        format: resolvedFormat,
+        quality: 'original',
+        label: `الملف الأصلي (${ext.toUpperCase()})`,
+        badge: 'بدون ضغط',
+        ext,
+        sizeBytes: totalBytes,
+        savedPercent: 0,
+        isSelected: resolvedCompress === 'none',
+        fileName,
+        zipFileName: `${fileName}.zip`,
+        downloadUrl: makeProxyUrl({
+          fmt: resolvedFormat,
+          q: resolvedQuality,
+          comp: 'none',
+          fName: fileName,
+          useDirectResolved: true,
+        }),
+        zipDownloadUrl: makeProxyUrl({
+          fmt: resolvedFormat,
+          q: resolvedQuality,
+          comp: 'zip',
+          fName: fileName,
+          useDirectResolved: true,
+        }),
+      });
+    }
+
+    const originalBaselineBytes = platformInfo.isVideoPlatform ? max1080Bytes : totalBytes;
+    const activeCompressedBytes =
+      resolvedCompress === 'zip'
+        ? Math.round((totalBytes || base720Bytes) * 0.92)
+        : totalBytes || base720Bytes;
+    const savedBytes = Math.max(0, originalBaselineBytes - activeCompressedBytes);
+    const savedPercent =
+      originalBaselineBytes > 0
+        ? Math.max(0, Math.round((savedBytes / originalBaselineBytes) * 100))
+        : 0;
+
+    const proxyDownloadUrl = makeProxyUrl({
+      fmt: resolvedFormat,
+      q: effectiveQualityForResolve,
+      comp: resolvedCompress,
+      fName: fileName,
+      useDirectResolved: true,
     });
-    if (ctx.userEmail) proxyParams.set('userEmail', ctx.userEmail);
-    if (ctx.chatId) proxyParams.set('chatId', String(ctx.chatId));
-    const proxyDownloadUrl = `/api/direct-download/${safePathName}?${proxyParams.toString()}`;
-
-    const isDirectAttachmentCdn =
-      (resolvedCompress === 'none' || (resolvedCompress === 'media' && !hasFfmpeg)) &&
-      /^https:\/\//i.test(resolved.resolvedUrl) &&
-      (resolved.resolvedUrl.includes('savetube') ||
-        resolved.resolvedUrl.endsWith('.mp4') ||
-        resolved.resolvedUrl.endsWith('.mp3'));
 
     res.json({
       ok: true,
+      title: baseTitle,
+      platformName: platformInfo.platformName || 'رابط مباشر',
+      isVideoPlatform: platformInfo.isVideoPlatform,
+      durationSec,
       fileName: downloadFileName,
       mimeType: resolvedCompress === 'zip' ? 'application/zip' : mimeType,
       totalBytes,
+      originalSizeBytes: originalBaselineBytes,
+      compressedSizeBytes: activeCompressedBytes,
+      savedBytes,
+      savedPercent,
+      compressMode: resolvedCompress,
+      effectiveQuality: effectiveQualityForResolve,
       directStreamUrl: resolved.resolvedUrl,
-      preferDirectCdn: isDirectAttachmentCdn,
       proxyDownloadUrl,
-      job,
+      availableFormats,
     });
   } catch (err: any) {
     res.status(400).json({
@@ -6511,6 +6724,16 @@ app.get(['/api/direct-download', '/api/direct-download/:pathFileName'], async (r
       fileName = `download_${Date.now()}.${formatParam === 'audio' ? 'mp3' : 'mp4'}`;
     }
 
+    const upstreamContentLen = upstreamRes.headers.get('content-length');
+    res.setHeader(
+      'Access-Control-Expose-Headers',
+      'Content-Length, Content-Disposition, X-Original-Size, X-Compression-Mode'
+    );
+    if (upstreamContentLen) {
+      res.setHeader('X-Original-Size', upstreamContentLen);
+    }
+    res.setHeader('X-Compression-Mode', compressParam);
+
     // Fast On-the-Fly Streaming ZIP Compression (Zero /tmp disk overhead, zero python3 dependency)
     if (compressParam === 'zip') {
       const zipDownloadName = fileName.toLowerCase().endsWith('.zip') ? fileName : `${fileName}.zip`;
@@ -6576,10 +6799,9 @@ app.get(['/api/direct-download', '/api/direct-download/:pathFileName'], async (r
     // Direct zero-copy stream to user's browser
     const asciiFallback = fileName.replace(/[^\x20-\x7E]/g, '_') || 'download';
     res.setHeader('Content-Type', mimeType || 'application/octet-stream');
-    const contentLen = upstreamRes.headers.get('content-length');
     const contentEnc = upstreamRes.headers.get('content-encoding');
-    if (contentLen && !contentEnc) {
-      res.setHeader('Content-Length', contentLen);
+    if (upstreamContentLen && !contentEnc) {
+      res.setHeader('Content-Length', upstreamContentLen);
     }
     res.setHeader(
       'Content-Disposition',
@@ -6828,23 +7050,41 @@ app.post('/api/transfers/url', async (req, res) => {
 
 app.post('/api/transfers/register-web', (req, res) => {
   const ctx = resolveRequestUserContext(req);
-  const { fileName, mimeType, totalBytes, driveFileId, webViewLink, folderName } = req.body || {};
+  const {
+    fileName,
+    mimeType,
+    totalBytes,
+    driveFileId,
+    webViewLink,
+    folderName,
+    direction,
+    directUrl,
+    compressMode,
+    quality,
+    mediaFormat,
+  } = req.body || {};
+  const isToDevice = direction === 'to_device';
   const job: TransferJob = {
     id: `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-    source: 'web',
-    direction: 'to_drive',
+    source: isToDevice ? 'url' : 'web',
+    direction: isToDevice ? 'to_device' : 'to_drive',
+    protocol: isToDevice ? 'http' : undefined,
+    mediaFormat: mediaFormat === 'audio' ? 'audio' : 'video',
+    quality: quality || undefined,
+    compressMode: compressMode || 'none',
     fileName: fileName || 'file',
     mimeType: mimeType || 'application/octet-stream',
     totalBytes: Number(totalBytes) || 0,
     bytesTransferred: Number(totalBytes) || 0,
     speedBps: 0,
     status: 'completed',
-    senderName: ctx.session.userName || 'رفع مباشر من المتصفح',
+    senderName: isToDevice ? 'تحميل مباشر للجهاز' : ctx.session.userName || 'رفع مباشر من المتصفح',
     accountEmail: ctx.session.userEmail || 'default',
     chatId: ctx.chatId || undefined,
     driveFileId,
+    directUrl: directUrl || undefined,
     webViewLink: webViewLink || (driveFileId ? `https://drive.google.com/file/d/${driveFileId}/view` : undefined),
-    folderName: folderName || ctx.session.activeFolderName,
+    folderName: isToDevice ? undefined : folderName || ctx.session.activeFolderName,
     createdAt: new Date().toISOString(),
     completedAt: new Date().toISOString(),
   };

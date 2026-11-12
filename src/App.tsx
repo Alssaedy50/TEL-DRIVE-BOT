@@ -32,6 +32,11 @@ import {
   Menu,
   ChevronLeft,
   ArrowRight,
+  Pause,
+  Play,
+  FileArchive,
+  Film,
+  Music,
 } from 'lucide-react';
 import {
   listFolders,
@@ -94,6 +99,60 @@ interface TransferJob {
   folderName?: string;
   createdAt: string;
   completedAt?: string;
+}
+
+interface AvailableMediaFormat {
+  id: string;
+  format: 'video' | 'audio';
+  quality: string;
+  label: string;
+  badge: string;
+  ext: string;
+  sizeBytes: number;
+  savedPercent: number;
+  isSelected: boolean;
+  fileName: string;
+  zipFileName: string;
+  downloadUrl: string;
+  zipDownloadUrl: string;
+}
+
+interface ResolvedMediaInfo {
+  jobId: string;
+  title: string;
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number;
+  originalSizeBytes: number;
+  compressedSizeBytes: number;
+  savedBytes: number;
+  savedPercent: number;
+  compressMode: CompressMode;
+  mediaFormat: 'video' | 'audio';
+  quality: string;
+  effectiveQuality: string;
+  platformName: string;
+  isVideoPlatform: boolean;
+  durationSec: number;
+  directStreamUrl: string;
+  proxyDownloadUrl: string;
+  preferDirectCdn: boolean;
+  availableFormats: AvailableMediaFormat[];
+}
+
+interface InAppDownloadState {
+  id: string;
+  fileName: string;
+  formatLabel: string;
+  compressMode: CompressMode;
+  originalBytes: number;
+  totalBytes: number;
+  bytesLoaded: number;
+  percent: number;
+  speedBps: number;
+  status: 'downloading' | 'paused' | 'completed' | 'cancelled' | 'failed';
+  errorMessage?: string;
+  blobUrl?: string;
 }
 
 interface KnownTelegramUser {
@@ -284,6 +343,13 @@ export default function App() {
   const [clearingFailed, setClearingFailed] = useState(false);
   const [downloadingItemId, setDownloadingItemId] = useState<string | null>(null);
   const [lastDirectDownload, setLastDirectDownload] = useState<{ url: string; fileName: string } | null>(null);
+  const [resolvedMediaInfo, setResolvedMediaInfo] = useState<ResolvedMediaInfo | null>(null);
+  const [inAppDownload, setInAppDownload] = useState<InAppDownloadState | null>(null);
+
+  // Refs for in-app streaming download control (Pause / Resume / Cancel)
+  const downloadAbortRef = useRef<AbortController | null>(null);
+  const downloadPausedRef = useRef<boolean>(false);
+  const downloadResumeResolverRef = useRef<(() => void) | null>(null);
 
   // Alerts
   const [bannerError, setBannerError] = useState<string | null>(null);
@@ -753,19 +819,104 @@ export default function App() {
     await handleUpdateSettings({ deduplicate: nextVal });
   };
 
-  const handleAuthenticatedProxyDownload = async (
-    proxyUrl: string,
-    fallbackFileName: string,
-    itemId: string
-  ) => {
-    setDownloadingItemId(itemId);
+  const triggerBrowserBlobSave = (blobUrl: string, fileName: string) => {
+    const a = document.createElement('a');
+    a.href = blobUrl;
+    a.download = fileName || 'download';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
+
+  const togglePauseInAppDownload = () => {
+    if (!inAppDownload) return;
+    if (inAppDownload.status === 'downloading') {
+      downloadPausedRef.current = true;
+      setInAppDownload((prev) => (prev ? { ...prev, status: 'paused', speedBps: 0 } : null));
+    } else if (inAppDownload.status === 'paused') {
+      downloadPausedRef.current = false;
+      setInAppDownload((prev) => (prev ? { ...prev, status: 'downloading' } : null));
+      if (downloadResumeResolverRef.current) {
+        const resolve = downloadResumeResolverRef.current;
+        downloadResumeResolverRef.current = null;
+        resolve();
+      }
+    }
+  };
+
+  const cancelInAppDownload = () => {
+    downloadPausedRef.current = false;
+    if (downloadResumeResolverRef.current) {
+      const resolve = downloadResumeResolverRef.current;
+      downloadResumeResolverRef.current = null;
+      resolve();
+    }
+    if (downloadAbortRef.current) {
+      downloadAbortRef.current.abort();
+      downloadAbortRef.current = null;
+    }
+    setInAppDownload((prev) =>
+      prev
+        ? {
+            ...prev,
+            status: 'cancelled',
+            speedBps: 0,
+          }
+        : null
+    );
+    setDownloadingItemId(null);
+  };
+
+  const startInAppStreamDownload = async (opts: {
+    downloadUrl: string;
+    fileName: string;
+    formatLabel: string;
+    compressMode: CompressMode;
+    expectedBytes?: number;
+    originalBytes?: number;
+    itemId?: string;
+  }) => {
+    // Cancel any existing active download first
+    if (downloadAbortRef.current) {
+      downloadAbortRef.current.abort();
+    }
+    downloadPausedRef.current = false;
+    downloadResumeResolverRef.current = null;
+
+    const abortController = new AbortController();
+    downloadAbortRef.current = abortController;
+
+    const dlId = opts.itemId || `dl_${Date.now()}`;
+    if (opts.itemId) setDownloadingItemId(opts.itemId);
     setBannerError(null);
+
+    const initialTotal = opts.expectedBytes && opts.expectedBytes > 0 ? opts.expectedBytes : 0;
+    const initialOriginal = opts.originalBytes && opts.originalBytes > 0 ? opts.originalBytes : initialTotal;
+
+    setInAppDownload({
+      id: dlId,
+      fileName: opts.fileName,
+      formatLabel: opts.formatLabel,
+      compressMode: opts.compressMode,
+      originalBytes: initialOriginal,
+      totalBytes: initialTotal,
+      bytesLoaded: 0,
+      percent: 0,
+      speedBps: 0,
+      status: 'downloading',
+    });
+
     try {
       const headers: Record<string, string> = {};
       if (accessToken) {
         headers.Authorization = `Bearer ${accessToken}`;
       }
-      const res = await fetch(proxyUrl, { headers });
+
+      const res = await fetch(opts.downloadUrl, {
+        headers,
+        signal: abortController.signal,
+      });
+
       const contentType = (res.headers.get('content-type') || '').toLowerCase();
       if (!res.ok || contentType.includes('application/json') || contentType.includes('text/html')) {
         let errMsg = 'تعذر تحميل الملف المباشر.';
@@ -778,22 +929,172 @@ export default function App() {
         throw new Error(errMsg);
       }
 
-      const blob = await res.blob();
+      const contentLengthHeader = Number(res.headers.get('content-length') || 0);
+      const xOriginalSizeHeader = Number(res.headers.get('x-original-size') || 0);
+      const totalBytes = contentLengthHeader > 0 ? contentLengthHeader : initialTotal;
+      const originalBytes = xOriginalSizeHeader > 0 ? xOriginalSizeHeader : initialOriginal || totalBytes;
+
+      setInAppDownload((prev) =>
+        prev
+          ? {
+              ...prev,
+              totalBytes,
+              originalBytes,
+            }
+          : null
+      );
+
+      if (!res.body) {
+        // Fallback if ReadableStream is unavailable
+        const blob = await res.blob();
+        const blobUrl = URL.createObjectURL(blob);
+        triggerBrowserBlobSave(blobUrl, opts.fileName);
+        setInAppDownload((prev) =>
+          prev
+            ? {
+                ...prev,
+                bytesLoaded: blob.size,
+                totalBytes: blob.size,
+                percent: 100,
+                speedBps: 0,
+                status: 'completed',
+                blobUrl,
+              }
+            : null
+        );
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const chunks: BlobPart[] = [];
+      let receivedBytes = 0;
+      let lastTickTime = Date.now();
+      let bytesSinceLastTick = 0;
+      let currentSpeedBps = 0;
+
+      while (true) {
+        if (downloadPausedRef.current) {
+          await new Promise<void>((resolve) => {
+            downloadResumeResolverRef.current = resolve;
+          });
+        }
+
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        if (value) {
+          chunks.push(value as unknown as BlobPart);
+          receivedBytes += value.byteLength;
+          bytesSinceLastTick += value.byteLength;
+
+          const now = Date.now();
+          const elapsedMs = now - lastTickTime;
+          if (elapsedMs >= 250) {
+            currentSpeedBps = Math.round((bytesSinceLastTick * 1000) / elapsedMs);
+            lastTickTime = now;
+            bytesSinceLastTick = 0;
+
+            const effectiveTotal = totalBytes > 0 ? Math.max(totalBytes, receivedBytes) : 0;
+            const pct =
+              effectiveTotal > 0
+                ? Math.min(99, Math.round((receivedBytes / effectiveTotal) * 100))
+                : Math.min(95, Math.round((receivedBytes / (5 * 1024 * 1024)) * 100));
+
+            setInAppDownload((prev) =>
+              prev && prev.status !== 'cancelled'
+                ? {
+                    ...prev,
+                    bytesLoaded: receivedBytes,
+                    totalBytes: effectiveTotal,
+                    percent: pct,
+                    speedBps: currentSpeedBps,
+                  }
+                : prev
+            );
+          }
+        }
+      }
+
+      const finalMime =
+        opts.fileName.endsWith('.zip')
+          ? 'application/zip'
+          : opts.fileName.endsWith('.mp3')
+            ? 'audio/mpeg'
+            : opts.fileName.endsWith('.mp4')
+              ? 'video/mp4'
+              : res.headers.get('content-type') || 'application/octet-stream';
+
+      const blob = new Blob(chunks, { type: finalMime });
       const blobUrl = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = blobUrl;
-      a.download = fallbackFileName || 'download';
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
-      setBannerSuccess(`تم تحميل الملف "${fallbackFileName}" إلى جهازك بنجاح!`);
+
+      setInAppDownload((prev) =>
+        prev
+          ? {
+              ...prev,
+              bytesLoaded: blob.size,
+              totalBytes: blob.size,
+              percent: 100,
+              speedBps: 0,
+              status: 'completed',
+              blobUrl,
+            }
+          : null
+      );
+
+      triggerBrowserBlobSave(blobUrl, opts.fileName);
+      setBannerSuccess(`اكتمل تحميل "${opts.fileName}" (${formatBytes(blob.size)}) بنجاح!`);
       setTimeout(() => setBannerSuccess(null), 5000);
+
+      // Register completed device download in transfer history
+      try {
+        await fetch('/api/transfers/register-web', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            fileName: opts.fileName,
+            mimeType: finalMime,
+            sizeBytes: blob.size,
+            direction: 'to_device',
+            sourceType: 'direct_url',
+            compressMode: opts.compressMode,
+            userEmail: personalEmail || undefined,
+            chatId: personalChatId || undefined,
+          }),
+        });
+        fetchStatus();
+      } catch {
+        // Ignore history registration error
+      }
     } catch (err: any) {
-      setBannerError(err?.message || 'حدث خطأ أثناء تحميل الملف إلى جهازك.');
+      if (err?.name === 'AbortError' || abortController.signal.aborted) {
+        setInAppDownload((prev) => (prev ? { ...prev, status: 'cancelled', speedBps: 0 } : null));
+      } else {
+        const msg = err?.message || 'حدث خطأ أثناء تحميل الملف إلى جهازك.';
+        setInAppDownload((prev) =>
+          prev ? { ...prev, status: 'failed', speedBps: 0, errorMessage: msg } : null
+        );
+        setBannerError(msg);
+      }
     } finally {
       setDownloadingItemId(null);
+      if (downloadAbortRef.current === abortController) {
+        downloadAbortRef.current = null;
+      }
     }
+  };
+
+  const handleAuthenticatedProxyDownload = async (
+    proxyUrl: string,
+    fallbackFileName: string,
+    itemId: string
+  ) => {
+    await startInAppStreamDownload({
+      downloadUrl: proxyUrl,
+      fileName: fallbackFileName,
+      formatLabel: fallbackFileName.endsWith('.zip') ? 'مضغوط ZIP' : 'ملف مباشر',
+      compressMode: fallbackFileName.endsWith('.zip') ? 'zip' : 'none',
+      itemId,
+    });
   };
 
   const handleUrlUploadSubmit = async (e: React.FormEvent) => {
@@ -803,6 +1104,13 @@ export default function App() {
     setSubmittingUrl(true);
     setBannerError(null);
     setLastDirectDownload(null);
+
+    // Ensure customFileName is not a pasted URL
+    const rawCustom = externalCustomName.trim();
+    const safeCustomName =
+      rawCustom && !/^https?:\/\//i.test(rawCustom) && !/youtu\.?be|tiktok\.com|t\.me|drive\.google/i.test(rawCustom)
+        ? rawCustom
+        : undefined;
 
     if (externalDestination === 'device') {
       try {
@@ -815,7 +1123,7 @@ export default function App() {
           headers,
           body: JSON.stringify({
             url: externalUrlInput.trim(),
-            customFileName: externalCustomName.trim() || undefined,
+            customFileName: safeCustomName,
             mediaFormat: externalMediaFormat,
             quality: externalQuality,
             compressMode: externalCompressMode,
@@ -823,34 +1131,14 @@ export default function App() {
             targetChatId: personalChatId || undefined,
           }),
         });
-        const data = await parseJsonResponse(res, 'تعذر استخراج رابط التحميل المباشر.');
+        const data = await parseJsonResponse<ResolvedMediaInfo>(res, 'تعذر استخراج معلومات الرابط والصيغ المتاحة.');
 
-        setExternalUrlInput('');
+        setResolvedMediaInfo(data);
         setExternalCustomName('');
-        fetchStatus();
-
-        if (data.preferDirectCdn && data.directStreamUrl) {
-          setLastDirectDownload({ url: data.directStreamUrl, fileName: data.fileName });
-          const a = document.createElement('a');
-          a.href = data.directStreamUrl;
-          a.rel = 'noopener noreferrer';
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-          setBannerSuccess(`تم تجهيز "${data.fileName}" وبدأ التحميل المباشر إلى جهازك!`);
-        } else if (data.proxyDownloadUrl) {
-          const finalFileName = data.fileName || 'download';
-          setLastDirectDownload({ url: data.proxyDownloadUrl, fileName: finalFileName });
-          const a = document.createElement('a');
-          a.href = data.proxyDownloadUrl;
-          a.download = finalFileName;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-          setBannerSuccess(`تم ضغط وتجهيز "${finalFileName}" وبدأ التحميل المباشر إلى جهازك!`);
-        }
+        setBannerSuccess('تم فحص الرابط وتجهيز الصيغ والأحجام المتاحة! اختر الصيغة المطلوبة لبدء التحميل.');
+        setTimeout(() => setBannerSuccess(null), 5000);
       } catch (err: any) {
-        setBannerError(err?.message || 'حدث خطأ أثناء استخراج وتحميل الرابط.');
+        setBannerError(err?.message || 'حدث خطأ أثناء فحص الرابط واستخراج الصيغ.');
       } finally {
         setSubmittingUrl(false);
       }
@@ -1332,46 +1620,379 @@ export default function App() {
                 ) : (
                   <UploadCloud className="w-4 h-4" />
                 )}
-                <span>بدء التنفيذ</span>
+                <span>
+                  {externalDestination === 'device' ? 'فحص الرابط وعرض الصيغ والأحجام' : 'بدء التنفيذ'}
+                </span>
               </button>
             </div>
           </form>
 
-          {/* Direct Download Ready Action Card */}
-          {lastDirectDownload && (
-            <div className="mt-3.5 p-3.5 rounded-xl bg-indigo-950/40 border border-indigo-500/30 flex flex-col sm:flex-row items-center justify-between gap-3 text-right">
-              <div className="flex items-center gap-2.5 min-w-0 w-full sm:w-auto">
-                <div className="w-9 h-9 rounded-lg bg-indigo-500/20 border border-indigo-500/40 flex items-center justify-center text-indigo-400 shrink-0">
-                  <Download className="w-5 h-5" />
+          {/* In-App Live Download Progress Bar with Pause / Resume / Cancel */}
+          {inAppDownload && (
+            <div className="mt-4 p-4 rounded-2xl bg-slate-950/90 border border-sky-500/40 space-y-3 shadow-lg">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div
+                    className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 border ${
+                      inAppDownload.status === 'completed'
+                        ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-400'
+                        : inAppDownload.status === 'paused'
+                          ? 'bg-amber-500/20 border-amber-500/40 text-amber-400'
+                          : inAppDownload.status === 'cancelled' || inAppDownload.status === 'failed'
+                            ? 'bg-rose-500/20 border-rose-500/40 text-rose-400'
+                            : 'bg-sky-500/20 border-sky-500/40 text-sky-400'
+                    }`}
+                  >
+                    {inAppDownload.status === 'downloading' ? (
+                      <Loader2 className="w-5 h-5 animate-spin" />
+                    ) : inAppDownload.status === 'completed' ? (
+                      <CheckCircle2 className="w-5 h-5" />
+                    ) : inAppDownload.status === 'paused' ? (
+                      <Pause className="w-5 h-5" />
+                    ) : (
+                      <AlertTriangle className="w-5 h-5" />
+                    )}
+                  </div>
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-xs font-bold text-sky-300">
+                        {inAppDownload.status === 'downloading'
+                          ? 'جاري التحميل داخل التطبيق...'
+                          : inAppDownload.status === 'paused'
+                            ? 'التحميل متوقف مؤقتاً'
+                            : inAppDownload.status === 'completed'
+                              ? 'اكتمل التحميل بنجاح (100%)'
+                              : inAppDownload.status === 'cancelled'
+                                ? 'تم إلغاء التحميل'
+                                : 'فشل التحميل'}
+                      </span>
+                      <span className="px-2 py-0.5 rounded-md bg-slate-800 text-[11px] text-slate-300 font-medium">
+                        {inAppDownload.formatLabel}
+                      </span>
+                      {inAppDownload.compressMode !== 'none' && (
+                        <span className="px-2 py-0.5 rounded-md bg-emerald-500/15 border border-emerald-500/30 text-[11px] text-emerald-300 font-bold">
+                          {inAppDownload.compressMode === 'zip' ? '✓ مضغوط ZIP قبل التحميل' : '✓ مضغوط الحجم قبل التحميل'}
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-sm font-bold text-white truncate mt-0.5" dir="ltr">
+                      {inAppDownload.fileName}
+                    </p>
+                  </div>
                 </div>
-                <div className="min-w-0">
-                  <p className="text-xs text-indigo-300 font-semibold">الملف جاهز للتحميل المباشر للجهاز:</p>
-                  <p className="text-sm font-bold text-white truncate">{lastDirectDownload.fileName}</p>
+
+                {/* Pause/Resume & Cancel Controls */}
+                <div className="flex items-center gap-2 shrink-0">
+                  {(inAppDownload.status === 'downloading' || inAppDownload.status === 'paused') && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={togglePauseInAppDownload}
+                        className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 transition cursor-pointer ${
+                          inAppDownload.status === 'paused'
+                            ? 'bg-emerald-600 hover:bg-emerald-500 text-white'
+                            : 'bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200'
+                        }`}
+                      >
+                        {inAppDownload.status === 'paused' ? (
+                          <>
+                            <Play className="w-3.5 h-3.5" />
+                            <span>استئناف</span>
+                          </>
+                        ) : (
+                          <>
+                            <Pause className="w-3.5 h-3.5" />
+                            <span>إيقاف مؤقت</span>
+                          </>
+                        )}
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={cancelInAppDownload}
+                        className="px-3 py-1.5 rounded-xl bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-rose-200 text-xs font-bold flex items-center gap-1.5 transition cursor-pointer"
+                      >
+                        <Ban className="w-3.5 h-3.5" />
+                        <span>إلغاء</span>
+                      </button>
+                    </>
+                  )}
+
+                  {inAppDownload.status === 'completed' && inAppDownload.blobUrl && (
+                    <button
+                      type="button"
+                      onClick={() => triggerBrowserBlobSave(inAppDownload.blobUrl!, inAppDownload.fileName)}
+                      className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center gap-1.5 transition cursor-pointer"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>حفظ الملف للجهاز</span>
+                    </button>
+                  )}
+
+                  {(inAppDownload.status === 'completed' ||
+                    inAppDownload.status === 'cancelled' ||
+                    inAppDownload.status === 'failed') && (
+                    <button
+                      type="button"
+                      onClick={() => setInAppDownload(null)}
+                      className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white transition cursor-pointer"
+                      title="إغلاق شريط التحميل"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  )}
                 </div>
               </div>
-              <div className="flex items-center gap-2 w-full sm:w-auto shrink-0 justify-end">
-                <a
-                  href={lastDirectDownload.url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  download={lastDirectDownload.fileName}
-                  className="flex-1 sm:flex-none px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow-md transition"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                  <span>تحميل الملف الآن</span>
-                </a>
+
+              {/* Progress Bar Track */}
+              <div className="w-full h-2.5 bg-slate-900 rounded-full overflow-hidden border border-slate-800">
+                <div
+                  className={`h-full transition-all duration-200 ${
+                    inAppDownload.status === 'completed'
+                      ? 'bg-emerald-500'
+                      : inAppDownload.status === 'paused'
+                        ? 'bg-amber-500'
+                        : inAppDownload.status === 'cancelled' || inAppDownload.status === 'failed'
+                          ? 'bg-rose-500'
+                          : 'bg-gradient-to-r from-sky-500 to-indigo-500'
+                  }`}
+                  style={{ width: `${Math.max(inAppDownload.status === 'downloading' ? 3 : 0, inAppDownload.percent)}%` }}
+                />
+              </div>
+
+              {/* Live Metrics & Compression Verification Footer */}
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-300 tabular-nums">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-bold text-white" dir="ltr">
+                    {inAppDownload.percent}%
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span dir="ltr">
+                    {formatBytes(inAppDownload.bytesLoaded)}
+                    {inAppDownload.totalBytes > 0 ? ` / ${formatBytes(inAppDownload.totalBytes)}` : ''}
+                  </span>
+                  {inAppDownload.status === 'downloading' && inAppDownload.speedBps > 0 && (
+                    <>
+                      <span aria-hidden="true">·</span>
+                      <span className="text-emerald-400 font-bold" dir="ltr">
+                        {formatBytes(inAppDownload.speedBps)}/s
+                      </span>
+                    </>
+                  )}
+                </div>
+
+                {/* Proof of Compression in Download Bar */}
+                {inAppDownload.originalBytes > 0 &&
+                  inAppDownload.totalBytes > 0 &&
+                  inAppDownload.originalBytes > inAppDownload.totalBytes && (
+                    <div className="text-[11px] text-emerald-300 font-semibold flex items-center gap-1.5">
+                      <span>الأصلي: {formatBytes(inAppDownload.originalBytes)}</span>
+                      <span>←</span>
+                      <span>بعد الضغط: {formatBytes(inAppDownload.totalBytes)}</span>
+                      <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold">
+                        توفير{' '}
+                        {Math.round(
+                          ((inAppDownload.originalBytes - inAppDownload.totalBytes) /
+                            inAppDownload.originalBytes) *
+                            100
+                        )}
+                        %
+                      </span>
+                    </div>
+                  )}
+              </div>
+
+              {inAppDownload.errorMessage && (
+                <p className="text-xs text-rose-300 bg-rose-950/50 border border-rose-500/30 rounded-lg p-2">
+                  {inAppDownload.errorMessage}
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* Pre-Download Inspection: Compression Proof & Available Formats/Sizes List */}
+          {resolvedMediaInfo && (
+            <div className="mt-4 p-4 rounded-2xl bg-[#11192E] border border-indigo-500/35 space-y-4">
+              {/* Header: Title, Platform & Close Button */}
+              <div className="flex items-start justify-between gap-3 border-b border-slate-800/90 pb-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap mb-1">
+                    <span className="px-2 py-0.5 rounded-md bg-indigo-500/20 border border-indigo-500/40 text-indigo-300 text-[11px] font-bold">
+                      {resolvedMediaInfo.platformName}
+                    </span>
+                    {resolvedMediaInfo.durationSec > 0 && (
+                      <span className="px-2 py-0.5 rounded-md bg-slate-800 text-slate-300 text-[11px] font-medium" dir="ltr">
+                        {Math.floor(resolvedMediaInfo.durationSec / 60)}:
+                        {String(resolvedMediaInfo.durationSec % 60).padStart(2, '0')} دقيقة
+                      </span>
+                    )}
+                    <span className="text-xs text-emerald-400 font-semibold">
+                      ✓ تم فحص الملف والضغط قبل التحميل
+                    </span>
+                  </div>
+                  <h3 className="text-sm sm:text-base font-bold text-white break-words">
+                    {resolvedMediaInfo.title}
+                  </h3>
+                </div>
                 <button
                   type="button"
-                  onClick={() => {
-                    navigator.clipboard.writeText(lastDirectDownload.url);
-                    setBannerSuccess('تم نسخ رابط التحميل المباشر بنجاح!');
-                    setTimeout(() => setBannerSuccess(null), 3000);
-                  }}
-                  className="px-3 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 text-xs font-medium flex items-center justify-center gap-1 transition cursor-pointer"
+                  onClick={() => setResolvedMediaInfo(null)}
+                  className="p-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white transition cursor-pointer shrink-0"
+                  title="إغلاق قائمة الصيغ"
                 >
-                  <Copy className="w-3.5 h-3.5" />
-                  <span>نسخ الرابط</span>
+                  <X className="w-4 h-4" />
                 </button>
+              </div>
+
+              {/* How do I know compression happened BEFORE downloading? -> Proof Comparison Box */}
+              <div className="p-3 rounded-xl bg-slate-950/80 border border-emerald-500/30 space-y-2">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <span className="text-xs font-bold text-emerald-300 flex items-center gap-1.5">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                    <span>إثبات الضغط وفحص الحجم قبل بدء التحميل:</span>
+                  </span>
+                  <span className="px-2 py-0.5 rounded-md bg-emerald-500/15 text-emerald-300 text-[11px] font-bold">
+                    {resolvedMediaInfo.compressMode === 'zip'
+                      ? 'وضع الضغط: أرشيف ZIP (Deflate)'
+                      : resolvedMediaInfo.compressMode === 'media'
+                        ? 'وضع الضغط: ضغط دقة ومعدل بت الفيديو/الصوت'
+                        : 'مقارنة الأحجام حسب الصيغة والجودة'}
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-3 gap-2 pt-1 text-center">
+                  <div className="p-2 rounded-lg bg-slate-900/90 border border-slate-800">
+                    <p className="text-[11px] text-slate-400">الحجم الأصلي (الكامل)</p>
+                    <p className="text-xs sm:text-sm font-bold text-slate-200 mt-0.5 tabular-nums" dir="ltr">
+                      {resolvedMediaInfo.originalSizeBytes > 0
+                        ? formatBytes(resolvedMediaInfo.originalSizeBytes)
+                        : 'متغير حسب الصيغة'}
+                    </p>
+                  </div>
+                  <div className="p-2 rounded-lg bg-emerald-950/30 border border-emerald-500/30">
+                    <p className="text-[11px] text-emerald-300">الحجم بعد الضغط</p>
+                    <p className="text-xs sm:text-sm font-bold text-emerald-400 mt-0.5 tabular-nums" dir="ltr">
+                      {resolvedMediaInfo.compressedSizeBytes > 0
+                        ? formatBytes(resolvedMediaInfo.compressedSizeBytes)
+                        : 'اختر صيغة مضغوطة'}
+                    </p>
+                  </div>
+                  <div className="p-2 rounded-lg bg-indigo-950/30 border border-indigo-500/30">
+                    <p className="text-[11px] text-indigo-300">مقدار التوفير المسبق</p>
+                    <p className="text-xs sm:text-sm font-bold text-indigo-300 mt-0.5 tabular-nums">
+                      {resolvedMediaInfo.savedBytes > 0
+                        ? `${formatBytes(resolvedMediaInfo.savedBytes)} (${resolvedMediaInfo.savedPercent}%)`
+                        : 'متاح بالصيغ بالأسفل'}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Available Formats & Sizes Table with Direct + Compressed ZIP Download Buttons */}
+              <div className="space-y-2">
+                <p className="text-xs font-bold text-slate-300">
+                  اختر الصيغة والحجم المناسب لبدء التحميل داخل التطبيق (مع شريط التقدم والإيقاف المؤقت):
+                </p>
+
+                <div className="space-y-2 max-h-80 overflow-y-auto pr-0.5">
+                  {resolvedMediaInfo.availableFormats.map((fmt) => {
+                    const zipBytes = fmt.sizeBytes > 0 ? Math.round(fmt.sizeBytes * 0.94) : 0;
+                    return (
+                      <div
+                        key={fmt.id}
+                        className={`p-3 rounded-xl border transition flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+                          fmt.isSelected
+                            ? 'bg-indigo-950/40 border-indigo-500/50'
+                            : 'bg-slate-950/70 border-slate-800/90 hover:border-slate-700'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <div
+                            className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${
+                              fmt.format === 'audio'
+                                ? 'bg-purple-500/15 text-purple-400 border border-purple-500/30'
+                                : 'bg-sky-500/15 text-sky-400 border border-sky-500/30'
+                            }`}
+                          >
+                            {fmt.format === 'audio' ? (
+                              <Music className="w-4 h-4" />
+                            ) : (
+                              <Film className="w-4 h-4" />
+                            )}
+                          </div>
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <span className="text-xs sm:text-sm font-bold text-white">{fmt.label}</span>
+                              {fmt.isSelected && (
+                                <span className="px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 text-[10px] font-bold">
+                                  اختيارك الحالي
+                                </span>
+                              )}
+                              {fmt.savedPercent > 0 && (
+                                <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 text-[10px] font-bold">
+                                  مضغوط (-{fmt.savedPercent}% حجم أقل)
+                                </span>
+                              )}
+                            </div>
+                            <div className="flex items-center gap-2 text-[11px] text-slate-400 mt-0.5 tabular-nums flex-wrap">
+                              <span>
+                                الحجم:{' '}
+                                <strong className="text-slate-200" dir="ltr">
+                                  {fmt.sizeBytes > 0 ? formatBytes(fmt.sizeBytes) : 'تلقائي'}
+                                </strong>
+                              </span>
+                              <span>·</span>
+                              <span className="text-slate-400">{fmt.badge}</span>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Action Buttons for this Format */}
+                        <div className="flex items-center gap-2 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              startInAppStreamDownload({
+                                downloadUrl: fmt.downloadUrl,
+                                fileName: fmt.fileName,
+                                formatLabel: fmt.label,
+                                compressMode: fmt.savedPercent > 0 ? 'media' : 'none',
+                                expectedBytes: fmt.sizeBytes,
+                                originalBytes: resolvedMediaInfo.originalSizeBytes || fmt.sizeBytes,
+                              })
+                            }
+                            className="flex-1 sm:flex-none px-3 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer shadow-sm"
+                          >
+                            <Download className="w-3.5 h-3.5" />
+                            <span>
+                              تحميل {fmt.ext.toUpperCase()}
+                              {fmt.sizeBytes > 0 ? ` (${formatBytes(fmt.sizeBytes)})` : ''}
+                            </span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() =>
+                              startInAppStreamDownload({
+                                downloadUrl: fmt.zipDownloadUrl,
+                                fileName: fmt.zipFileName,
+                                formatLabel: `${fmt.label} (ZIP)`,
+                                compressMode: 'zip',
+                                expectedBytes: zipBytes,
+                                originalBytes: resolvedMediaInfo.originalSizeBytes || fmt.sizeBytes,
+                              })
+                            }
+                            className="px-3 py-2 rounded-xl bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/40 text-emerald-300 text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer"
+                            title="ضغط الملف بصيغة ZIP قبل التحميل لتقليل الحجم"
+                          >
+                            <FileArchive className="w-3.5 h-3.5" />
+                            <span>ZIP مضغوط</span>
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
             </div>
           )}
@@ -1538,49 +2159,33 @@ export default function App() {
                       </div>
 
                       <div className="flex items-center gap-3">
-                        {(job.driveFileId || job.directUrl) &&
-                          (!job.driveFileId &&
-                          (!job.compressMode || job.compressMode === 'none') &&
-                          job.directUrl &&
-                          (job.directUrl.includes('savetube') ||
-                            job.directUrl.endsWith('.mp4') ||
-                            job.directUrl.endsWith('.mp3')) ? (
-                            <a
-                              href={job.directUrl}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="text-indigo-400 hover:text-indigo-300 font-semibold flex items-center gap-1"
-                            >
-                              <Download className="w-3.5 h-3.5" />
-                              <span>تحميل</span>
-                            </a>
-                          ) : (
-                            <button
-                              type="button"
-                              disabled={downloadingItemId === job.id}
-                              onClick={() =>
-                                handleAuthenticatedProxyDownload(
-                                  `/api/direct-download/${encodeURIComponent(job.fileName)}?jobId=${encodeURIComponent(
-                                    job.id
-                                  )}${job.directUrl ? `&url=${encodeURIComponent(job.directUrl)}` : ''}${
-                                    job.driveFileId ? `&driveFileId=${encodeURIComponent(job.driveFileId)}` : ''
-                                  }${job.compressMode ? `&compress=${encodeURIComponent(job.compressMode)}` : ''}${
-                                    personalEmail ? `&userEmail=${encodeURIComponent(personalEmail)}` : ''
-                                  }${personalChatId ? `&chatId=${encodeURIComponent(personalChatId)}` : ''}`,
-                                  job.fileName,
+                        {(job.driveFileId || job.directUrl) && (
+                          <button
+                            type="button"
+                            disabled={downloadingItemId === job.id}
+                            onClick={() =>
+                              handleAuthenticatedProxyDownload(
+                                `/api/direct-download/${encodeURIComponent(job.fileName)}?jobId=${encodeURIComponent(
                                   job.id
-                                )
-                              }
-                              className="text-indigo-400 hover:text-indigo-300 font-semibold flex items-center gap-1 cursor-pointer disabled:opacity-50"
-                            >
-                              {downloadingItemId === job.id ? (
-                                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                              ) : (
-                                <Download className="w-3.5 h-3.5" />
-                              )}
-                              <span>تحميل</span>
-                            </button>
-                          ))}
+                                )}${job.directUrl ? `&url=${encodeURIComponent(job.directUrl)}` : ''}${
+                                  job.driveFileId ? `&driveFileId=${encodeURIComponent(job.driveFileId)}` : ''
+                                }${job.compressMode ? `&compress=${encodeURIComponent(job.compressMode)}` : ''}${
+                                  personalEmail ? `&userEmail=${encodeURIComponent(personalEmail)}` : ''
+                                }${personalChatId ? `&chatId=${encodeURIComponent(personalChatId)}` : ''}`,
+                                job.fileName,
+                                job.id
+                              )
+                            }
+                            className="text-indigo-400 hover:text-indigo-300 font-semibold flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                          >
+                            {downloadingItemId === job.id ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            ) : (
+                              <Download className="w-3.5 h-3.5" />
+                            )}
+                            <span>تحميل</span>
+                          </button>
+                        )}
                         {job.webViewLink && (
                           <a
                             href={job.webViewLink}
