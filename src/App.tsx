@@ -121,6 +121,9 @@ interface AvailableMediaFormat {
   fileName: string;
   zipFileName: string;
   sourceStreamUrl?: string;
+  mediaStreamUrl?: string;
+  requiresWorkerForOriginal?: boolean;
+  requiresWorkerForMedia?: boolean;
   downloadUrl: string;
   mediaDownloadUrl?: string;
   zipDownloadUrl: string;
@@ -159,7 +162,9 @@ interface InAppDownloadState {
   bytesLoaded: number;
   percent: number;
   speedBps: number;
-  status: 'downloading' | 'paused' | 'completed' | 'cancelled' | 'failed';
+  status: 'worker_processing' | 'downloading' | 'paused' | 'completed' | 'cancelled' | 'failed';
+  workerJobId?: string;
+  workerStageLabel?: string;
   errorMessage?: string;
   blobUrl?: string;
 }
@@ -869,15 +874,18 @@ export default function App() {
       downloadAbortRef.current.abort();
       downloadAbortRef.current = null;
     }
-    setInAppDownload((prev) =>
-      prev
+    setInAppDownload((prev) => {
+      if (prev?.workerJobId) {
+        fetch(`/api/media-worker/jobs/${prev.workerJobId}/cancel`, { method: 'POST' }).catch(() => {});
+      }
+      return prev
         ? {
             ...prev,
             status: 'cancelled',
             speedBps: 0,
           }
-        : null
-    );
+        : null;
+    });
     setDownloadingItemId(null);
   };
 
@@ -889,6 +897,14 @@ export default function App() {
     expectedBytes?: number;
     originalBytes?: number;
     itemId?: string;
+    requiresWorker?: boolean;
+    workerPayload?: {
+      url: string;
+      sourceUrl?: string;
+      format: 'video' | 'audio';
+      quality: string;
+      durationSec?: number;
+    };
   }) => {
     // Cancel any existing active download first
     if (downloadAbortRef.current) {
@@ -917,7 +933,10 @@ export default function App() {
       bytesLoaded: 0,
       percent: 0,
       speedBps: 0,
-      status: 'downloading',
+      status: opts.requiresWorker ? 'worker_processing' : 'downloading',
+      workerStageLabel: opts.requiresWorker
+        ? 'عامل ضغط الفيديو المستقل: جاري بدء مهمة الضغط...'
+        : undefined,
     });
 
     try {
@@ -926,7 +945,100 @@ export default function App() {
         headers.Authorization = `Bearer ${accessToken}`;
       }
 
-      const res = await fetch(opts.downloadUrl, {
+      let effectiveDownloadUrl = opts.downloadUrl;
+
+      // Stage A: Decoupled Independent Media Worker (Only when FFmpeg compression is explicitly needed)
+      if (opts.requiresWorker && opts.workerPayload) {
+        try {
+          const startRes = await fetch('/api/media-worker/jobs', {
+            method: 'POST',
+            headers: { ...headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              ...opts.workerPayload,
+              compressMode: opts.compressMode,
+              fileName: opts.fileName,
+              targetBytes: initialTotal,
+              originalBytes: initialOriginal,
+            }),
+            signal: abortController.signal,
+          });
+          if (startRes.ok) {
+            const startData = await startRes.json();
+            const wJobId = startData?.job?.id;
+            if (wJobId) {
+              setInAppDownload((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      workerJobId: wJobId,
+                      workerStageLabel: startData.job.stageLabel || 'عامل ضغط الفيديو المستقل...',
+                    }
+                  : null
+              );
+
+              while (!abortController.signal.aborted) {
+                await new Promise((r) => setTimeout(r, 500));
+                const pollRes = await fetch(`/api/media-worker/jobs/${wJobId}`, {
+                  headers,
+                  signal: abortController.signal,
+                });
+                if (!pollRes.ok) {
+                  // If serverless instance rotated, fall back gracefully to direct stream
+                  break;
+                }
+                const pollData = await pollRes.json();
+                const wJob = pollData?.job;
+                if (!wJob) break;
+
+                if (wJob.status === 'completed' && wJob.downloadUrl) {
+                  effectiveDownloadUrl = wJob.downloadUrl;
+                  break;
+                }
+                if (wJob.status === 'failed') {
+                  throw new Error(wJob.errorMessage || 'تعذر إكمال ضغط الفيديو في عامل المعالجة المستقل.');
+                }
+                if (wJob.status === 'cancelled') {
+                  throw new Error('AbortError');
+                }
+
+                setInAppDownload((prev) =>
+                  prev && prev.status !== 'cancelled'
+                    ? {
+                        ...prev,
+                        status: 'worker_processing',
+                        percent: Math.min(99, Number(wJob.progress) || 0),
+                        workerStageLabel:
+                          wJob.stageLabel || 'عامل ضغط الفيديو المستقل: جاري تقليص الحجم...',
+                      }
+                    : prev
+                );
+              }
+            }
+          }
+        } catch (workerErr: any) {
+          if (
+            workerErr?.name === 'AbortError' ||
+            workerErr?.message === 'AbortError' ||
+            abortController.signal.aborted
+          ) {
+            throw workerErr;
+          }
+          console.warn('Independent worker fallback to direct stream:', workerErr?.message);
+        }
+      }
+
+      // Stage B: Fast Direct Streaming Download
+      setInAppDownload((prev) =>
+        prev && prev.status !== 'cancelled'
+          ? {
+              ...prev,
+              status: 'downloading',
+              workerStageLabel: undefined,
+            }
+          : prev
+      );
+
+      const res = await fetch(effectiveDownloadUrl, {
         headers,
         signal: abortController.signal,
       });
@@ -960,7 +1072,6 @@ export default function App() {
       );
 
       if (!res.body) {
-        // Fallback if ReadableStream is unavailable
         const blob = await res.blob();
         const blobUrl = URL.createObjectURL(blob);
         triggerBrowserBlobSave(blobUrl, opts.fileName);
@@ -1009,17 +1120,19 @@ export default function App() {
             lastTickTime = now;
             bytesSinceLastTick = 0;
 
-            const effectiveTotal = totalBytes > 0 ? Math.max(totalBytes, receivedBytes) : 0;
+            const effectiveTotal = totalBytes > 0 ? totalBytes : receivedBytes;
+            const displayedLoaded =
+              totalBytes > 0 ? Math.min(receivedBytes, totalBytes) : receivedBytes;
             const pct =
               effectiveTotal > 0
-                ? Math.min(99, Math.round((receivedBytes / effectiveTotal) * 100))
+                ? Math.min(99, Math.round((displayedLoaded / effectiveTotal) * 100))
                 : Math.min(95, Math.round((receivedBytes / (5 * 1024 * 1024)) * 100));
 
             setInAppDownload((prev) =>
               prev && prev.status !== 'cancelled'
                 ? {
                     ...prev,
-                    bytesLoaded: receivedBytes,
+                    bytesLoaded: displayedLoaded,
                     totalBytes: effectiveTotal,
                     percent: pct,
                     speedBps: currentSpeedBps,
@@ -1198,7 +1311,7 @@ export default function App() {
       if (!fmtOrBytes) return 0;
       if (typeof fmtOrBytes === 'object') {
         if (mode === 'zip') {
-          return fmtOrBytes.zipCompressedBytes || Math.max(32 * 1024, Math.round(fmtOrBytes.sizeBytes * 0.85));
+          return fmtOrBytes.zipCompressedBytes || Math.max(32 * 1024, Math.round(fmtOrBytes.sizeBytes * 0.985));
         }
         if (mode === 'media') {
           return fmtOrBytes.mediaCompressedBytes || Math.max(32 * 1024, Math.round(fmtOrBytes.sizeBytes * 0.65));
@@ -1206,7 +1319,7 @@ export default function App() {
         return fmtOrBytes.sizeBytes;
       }
       if (fmtOrBytes <= 0) return 0;
-      if (mode === 'zip') return Math.max(32 * 1024, Math.round(fmtOrBytes * 0.85));
+      if (mode === 'zip') return Math.max(32 * 1024, Math.round(fmtOrBytes * 0.985));
       if (mode === 'media') return Math.max(32 * 1024, Math.round(fmtOrBytes * 0.65));
       return fmtOrBytes;
     },
@@ -1268,6 +1381,14 @@ export default function App() {
           ? `${fmt.label} (مقلّص)`
           : fmt.label;
 
+      // Only invoke the independent FFmpeg worker when explicitly needed for media compression or compact audio
+      const requiresWorker =
+        mode === 'media'
+          ? Boolean(fmt.requiresWorkerForMedia)
+          : mode === 'none'
+            ? Boolean(fmt.requiresWorkerForOriginal)
+            : false;
+
       return {
         downloadUrl: finalUrl,
         fileName: targetFileName,
@@ -1275,9 +1396,17 @@ export default function App() {
         compressMode: effectiveCompress,
         expectedBytes: effectiveBytes,
         originalBytes: baselineOriginalBytes || fmt.sizeBytes,
+        requiresWorker,
+        workerPayload: {
+          url: externalUrlInput.trim(),
+          sourceUrl: mode === 'media' ? fmt.mediaStreamUrl || fmt.sourceStreamUrl : fmt.sourceStreamUrl,
+          format: fmt.format,
+          quality: fmt.quality,
+          durationSec: resolvedMediaInfo?.durationSec || 0,
+        },
       };
     },
-    [getEffectiveFormatBytes]
+    [getEffectiveFormatBytes, externalUrlInput, resolvedMediaInfo]
   );
 
   const handleUrlUploadSubmit = async (e: React.FormEvent) => {
@@ -2303,7 +2432,8 @@ export default function App() {
                             : 'bg-sky-500/20 border-sky-500/40 text-sky-400'
                     }`}
                   >
-                    {inAppDownload.status === 'downloading' ? (
+                    {inAppDownload.status === 'downloading' ||
+                    inAppDownload.status === 'worker_processing' ? (
                       <Loader2 className="w-5 h-5 animate-spin" />
                     ) : inAppDownload.status === 'completed' ? (
                       <CheckCircle2 className="w-5 h-5" />
@@ -2316,17 +2446,17 @@ export default function App() {
                   <div className="min-w-0">
                     <div className="flex items-center gap-2 flex-wrap text-xs text-slate-300">
                       <span className="font-bold text-sky-300">
-                        {inAppDownload.status === 'downloading'
-                          ? inAppDownload.bytesLoaded === 0
-                            ? 'جاري تجهيز وضغط الملف بالحجم المحدد...'
-                            : 'جاري التحميل داخل التطبيق...'
-                          : inAppDownload.status === 'paused'
-                            ? 'التحميل متوقف مؤقتاً'
-                            : inAppDownload.status === 'completed'
-                              ? 'اكتمل التحميل بنجاح (100%)'
-                              : inAppDownload.status === 'cancelled'
-                                ? 'تم إلغاء التحميل'
-                                : 'فشل التحميل'}
+                        {inAppDownload.status === 'worker_processing'
+                          ? inAppDownload.workerStageLabel || 'عامل ضغط الفيديو المستقل: جاري تقليص الحجم...'
+                          : inAppDownload.status === 'downloading'
+                            ? 'جاري التحميل المباشر داخل التطبيق...'
+                            : inAppDownload.status === 'paused'
+                              ? 'التحميل متوقف مؤقتاً'
+                              : inAppDownload.status === 'completed'
+                                ? 'اكتمل التحميل بنجاح (100%)'
+                                : inAppDownload.status === 'cancelled'
+                                  ? 'تم إلغاء التحميل'
+                                  : 'فشل التحميل'}
                       </span>
                       <span aria-hidden="true">·</span>
                       <span>{inAppDownload.formatLabel}</span>
@@ -2339,29 +2469,33 @@ export default function App() {
 
                 {/* Pause/Resume & Cancel Controls */}
                 <div className="flex items-center gap-2 shrink-0">
-                  {(inAppDownload.status === 'downloading' || inAppDownload.status === 'paused') && (
+                  {(inAppDownload.status === 'downloading' ||
+                    inAppDownload.status === 'worker_processing' ||
+                    inAppDownload.status === 'paused') && (
                     <>
-                      <button
-                        type="button"
-                        onClick={togglePauseInAppDownload}
-                        className={`min-h-[38px] px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 transition cursor-pointer ${
-                          inAppDownload.status === 'paused'
-                            ? 'bg-emerald-600 hover:bg-emerald-500 text-white'
-                            : 'bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200'
-                        }`}
-                      >
-                        {inAppDownload.status === 'paused' ? (
-                          <>
-                            <Play className="w-3.5 h-3.5" />
-                            <span>استئناف</span>
-                          </>
-                        ) : (
-                          <>
-                            <Pause className="w-3.5 h-3.5" />
-                            <span>إيقاف مؤقت</span>
-                          </>
-                        )}
-                      </button>
+                      {inAppDownload.status !== 'worker_processing' && (
+                        <button
+                          type="button"
+                          onClick={togglePauseInAppDownload}
+                          className={`min-h-[38px] px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 transition cursor-pointer ${
+                            inAppDownload.status === 'paused'
+                              ? 'bg-emerald-600 hover:bg-emerald-500 text-white'
+                              : 'bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200'
+                          }`}
+                        >
+                          {inAppDownload.status === 'paused' ? (
+                            <>
+                              <Play className="w-3.5 h-3.5" />
+                              <span>استئناف</span>
+                            </>
+                          ) : (
+                            <>
+                              <Pause className="w-3.5 h-3.5" />
+                              <span>إيقاف مؤقت</span>
+                            </>
+                          )}
+                        </button>
+                      )}
 
                       <button
                         type="button"
