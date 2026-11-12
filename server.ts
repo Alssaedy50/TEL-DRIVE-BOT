@@ -2,6 +2,7 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import https from 'https';
+import zlib from 'zlib';
 import { createDecipheriv } from 'crypto';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
@@ -24,12 +25,16 @@ let activeWebhookUrl: string | null = null;
 
 app.use(express.json({ limit: '50mb' }));
 app.use((req, res, next) => {
-  // Normalize req.url when rewritten by Vercel serverless /api/index
-  const matchedPath =
-    (req.headers['x-matched-path'] as string) ||
-    (req.headers['x-forwarded-uri'] as string);
-  if (matchedPath && matchedPath.startsWith('/api') && req.url !== matchedPath) {
-    req.url = matchedPath;
+  // Normalize req.url when rewritten to /api/index on Vercel while strictly preserving query string
+  if (req.url && (req.url === '/api/index' || req.url.startsWith('/api/index?'))) {
+    const matchedPath =
+      (req.headers['x-matched-path'] as string) ||
+      (req.headers['x-forwarded-uri'] as string);
+    if (matchedPath && matchedPath.startsWith('/api') && !matchedPath.startsWith('/api/index')) {
+      const qIdx = req.url.indexOf('?');
+      const query = qIdx >= 0 ? req.url.slice(qIdx) : '';
+      req.url = matchedPath.split('?')[0] + query;
+    }
   }
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -2156,8 +2161,176 @@ async function resolveTelegramPostLinkIfApplicable(
 }
 
 // ============================================================================
-// File & Media Compression Engine (ZIP Archive & FFmpeg Video/Audio Shrinker)
+// Pure Node.js Streaming ZIP & Media Compression Engine (Zero External Deps)
 // ============================================================================
+
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) {
+      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    table[i] = c >>> 0;
+  }
+  return table;
+})();
+
+function updateCrc32(crc: number, buf: Uint8Array): number {
+  let c = (crc ^ 0xffffffff) >>> 0;
+  for (let i = 0; i < buf.length; i++) {
+    c = CRC32_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+let cachedFfmpegAvailable: boolean | null = null;
+async function isFfmpegAvailable(): Promise<boolean> {
+  if (cachedFfmpegAvailable !== null) return cachedFfmpegAvailable;
+  try {
+    await execFileAsync('ffmpeg', ['-version'], { timeout: 3000 });
+    cachedFfmpegAvailable = true;
+  } catch {
+    cachedFfmpegAvailable = false;
+  }
+  return cachedFfmpegAvailable;
+}
+
+async function writeBufferToStream(out: NodeJS.WritableStream, buf: Buffer): Promise<void> {
+  if (!out.write(buf)) {
+    await new Promise<void>((resolve) => out.once('drain', resolve));
+  }
+}
+
+async function pipeStreamToZipWritable(
+  sourceIterable: AsyncIterable<Uint8Array>,
+  outStream: NodeJS.WritableStream,
+  entryFileName: string,
+  signal?: AbortSignal
+): Promise<void> {
+  const cleanEntryName = path.basename(entryFileName || 'file.bin').replace(/[/\\]/g, '_');
+  const nameBuf = Buffer.from(cleanEntryName, 'utf8');
+
+  const now = new Date();
+  const dosTime =
+    ((now.getHours() & 0x1f) << 11) |
+    ((now.getMinutes() & 0x3f) << 5) |
+    ((now.getSeconds() >> 1) & 0x1f);
+  const dosDate =
+    (((now.getFullYear() - 1980) & 0x7f) << 9) |
+    (((now.getMonth() + 1) & 0x0f) << 5) |
+    (now.getDate() & 0x1f);
+
+  // 1. Local File Header (30 bytes + filename) with Bit 3 (0x0008 Data Descriptor) + Bit 11 (0x0800 UTF-8)
+  const localHeader = Buffer.alloc(30);
+  localHeader.writeUInt32LE(0x04034b50, 0); // PK\x03\x04
+  localHeader.writeUInt16LE(20, 4); // Version needed to extract (2.0)
+  localHeader.writeUInt16LE(0x0808, 6); // Flags: Data Descriptor + UTF-8
+  localHeader.writeUInt16LE(8, 8); // Compression method: 8 (DEFLATE)
+  localHeader.writeUInt16LE(dosTime, 10);
+  localHeader.writeUInt16LE(dosDate, 12);
+  localHeader.writeUInt32LE(0, 14); // CRC-32 (in Data Descriptor)
+  localHeader.writeUInt32LE(0, 18); // Compressed size (in Data Descriptor)
+  localHeader.writeUInt32LE(0, 22); // Uncompressed size (in Data Descriptor)
+  localHeader.writeUInt16LE(nameBuf.length, 26);
+  localHeader.writeUInt16LE(0, 28); // Extra field length
+
+  await writeBufferToStream(outStream, localHeader);
+  await writeBufferToStream(outStream, nameBuf);
+
+  let crc = 0;
+  let uncompressedSize = 0;
+  let compressedSize = 0;
+
+  const deflater = zlib.createDeflateRaw({ level: 1 });
+  let deflateDrainPromise: Promise<void> | null = null;
+
+  deflater.on('data', (chunk: Buffer) => {
+    compressedSize += chunk.length;
+    if (!outStream.write(chunk)) {
+      deflateDrainPromise = new Promise<void>((r) => outStream.once('drain', r));
+    }
+  });
+
+  const deflateEndPromise = new Promise<void>((resolve, reject) => {
+    deflater.once('end', resolve);
+    deflater.once('error', reject);
+  });
+
+  for await (const rawChunk of sourceIterable) {
+    if (signal?.aborted) {
+      deflater.destroy();
+      throw new Error('CANCELLED_BY_USER');
+    }
+    if (!rawChunk || rawChunk.byteLength === 0) continue;
+    const buf = Buffer.from(rawChunk);
+    crc = updateCrc32(crc, buf);
+    uncompressedSize += buf.length;
+    if (!deflater.write(buf)) {
+      await new Promise<void>((r) => deflater.once('drain', r));
+    }
+    if (deflateDrainPromise) {
+      await deflateDrainPromise;
+      deflateDrainPromise = null;
+    }
+  }
+
+  deflater.end();
+  await deflateEndPromise;
+  if (deflateDrainPromise) {
+    await deflateDrainPromise;
+  }
+
+  const uCrc = crc >>> 0;
+  const uCompSize = compressedSize >>> 0;
+  const uUncompSize = uncompressedSize >>> 0;
+
+  // 2. Data Descriptor (16 bytes)
+  const dataDesc = Buffer.alloc(16);
+  dataDesc.writeUInt32LE(0x08074b50, 0); // PK\x07\x08
+  dataDesc.writeUInt32LE(uCrc, 4);
+  dataDesc.writeUInt32LE(uCompSize, 8);
+  dataDesc.writeUInt32LE(uUncompSize, 12);
+  await writeBufferToStream(outStream, dataDesc);
+
+  // 3. Central Directory File Header (46 bytes + filename)
+  const centralHeader = Buffer.alloc(46);
+  centralHeader.writeUInt32LE(0x02014b50, 0); // PK\x01\x02
+  centralHeader.writeUInt16LE(20, 4); // Version made by
+  centralHeader.writeUInt16LE(20, 6); // Version needed
+  centralHeader.writeUInt16LE(0x0808, 8); // Flags
+  centralHeader.writeUInt16LE(8, 10); // Method: DEFLATE
+  centralHeader.writeUInt16LE(dosTime, 12);
+  centralHeader.writeUInt16LE(dosDate, 14);
+  centralHeader.writeUInt32LE(uCrc, 16);
+  centralHeader.writeUInt32LE(uCompSize, 20);
+  centralHeader.writeUInt32LE(uUncompSize, 24);
+  centralHeader.writeUInt16LE(nameBuf.length, 28);
+  centralHeader.writeUInt16LE(0, 30); // Extra length
+  centralHeader.writeUInt16LE(0, 32); // Comment length
+  centralHeader.writeUInt16LE(0, 34); // Disk number
+  centralHeader.writeUInt16LE(0, 36); // Internal attrs
+  centralHeader.writeUInt32LE(0, 38); // External attrs
+  centralHeader.writeUInt32LE(0, 42); // Relative offset of local header (0)
+
+  await writeBufferToStream(outStream, centralHeader);
+  await writeBufferToStream(outStream, nameBuf);
+
+  // 4. End of Central Directory Record (22 bytes)
+  const cdOffset = (30 + nameBuf.length + uCompSize + 16) >>> 0;
+  const cdSize = (46 + nameBuf.length) >>> 0;
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0); // PK\x05\x06
+  eocd.writeUInt16LE(0, 4);
+  eocd.writeUInt16LE(0, 6);
+  eocd.writeUInt16LE(1, 8); // Entries on disk
+  eocd.writeUInt16LE(1, 10); // Total entries
+  eocd.writeUInt32LE(cdSize, 12);
+  eocd.writeUInt32LE(cdOffset, 16);
+  eocd.writeUInt16LE(0, 20); // Comment length
+
+  await writeBufferToStream(outStream, eocd);
+}
 
 async function compressLocalFile(
   inputPath: string,
@@ -2190,58 +2363,69 @@ async function compressLocalFile(
 
   // Mode 1: FFmpeg Media Compression (shrinks video/audio resolution & bitrate)
   if (compressMode === 'media' && (isVideo || isAudio)) {
-    const ext = isAudio ? '.mp3' : '.mp4';
-    const baseWithoutExt = originalFileName.replace(/\.[^/.]+$/, '');
-    const outMediaPath = `${inputPath}_compressed${ext}`;
-    try {
-      if (isVideo) {
-        await execFileAsync(
-          'ffmpeg',
-          [
-            '-y',
-            '-i',
-            inputPath,
-            '-vf',
-            "scale='min(854,iw)':-2",
-            '-c:v',
-            'libx264',
-            '-preset',
-            'ultrafast',
-            '-crf',
-            '28',
-            '-c:a',
-            'aac',
-            '-b:a',
-            '96k',
-            '-movflags',
-            '+faststart',
-            outMediaPath,
-          ],
-          { signal, timeout: 600000 }
-        );
-      } else {
-        await execFileAsync(
-          'ffmpeg',
-          ['-y', '-i', inputPath, '-vn', '-c:a', 'libmp3lame', '-b:a', '96k', outMediaPath],
-          { signal, timeout: 300000 }
-        );
-      }
+    const hasFfmpeg = await isFfmpegAvailable();
+    if (hasFfmpeg) {
+      const ext = isAudio ? '.mp3' : '.mp4';
+      const baseWithoutExt = originalFileName.replace(/\.[^/.]+$/, '');
+      const outMediaPath = `${inputPath}_compressed${ext}`;
+      try {
+        if (isVideo) {
+          await execFileAsync(
+            'ffmpeg',
+            [
+              '-y',
+              '-i',
+              inputPath,
+              '-vf',
+              "scale='min(854,iw)':-2",
+              '-c:v',
+              'libx264',
+              '-preset',
+              'ultrafast',
+              '-crf',
+              '28',
+              '-c:a',
+              'aac',
+              '-b:a',
+              '96k',
+              '-movflags',
+              '+faststart',
+              outMediaPath,
+            ],
+            { signal, timeout: 600000 }
+          );
+        } else {
+          await execFileAsync(
+            'ffmpeg',
+            ['-y', '-i', inputPath, '-vn', '-c:a', 'libmp3lame', '-b:a', '96k', outMediaPath],
+            { signal, timeout: 300000 }
+          );
+        }
 
-      if (fs.existsSync(outMediaPath) && fs.statSync(outMediaPath).size > 0) {
-        return {
-          finalPath: outMediaPath,
-          finalFileName: `${baseWithoutExt} (مضغوط)${ext}`,
-          finalMimeType: isAudio ? 'audio/mpeg' : 'video/mp4',
-          wasCompressed: true,
-        };
+        if (fs.existsSync(outMediaPath) && fs.statSync(outMediaPath).size > 0) {
+          return {
+            finalPath: outMediaPath,
+            finalFileName: `${baseWithoutExt} (مضغوط)${ext}`,
+            finalMimeType: isAudio ? 'audio/mpeg' : 'video/mp4',
+            wasCompressed: true,
+          };
+        }
+      } catch (err: any) {
+        if (signal.aborted) throw new Error('CANCELLED_BY_USER');
+        console.warn('FFmpeg media compression skipped:', err?.message);
       }
-    } catch (err: any) {
-      if (signal.aborted) throw new Error('CANCELLED_BY_USER');
-      console.warn('FFmpeg media compression fallback to ZIP:', err?.message);
+    } else {
+      // On serverless environments without FFmpeg, keep media playable without crashing
+      return {
+        finalPath: inputPath,
+        finalFileName: originalFileName,
+        finalMimeType: originalMimeType,
+        wasCompressed: false,
+      };
     }
   }
 
-  // Mode 2: Standard ZIP Archive Compression (.zip)
+  // Mode 2: Pure Node.js ZIP Archive Compression (.zip)
   if (lowerName.endsWith('.zip')) {
     return {
       finalPath: inputPath,
@@ -2252,17 +2436,10 @@ async function compressLocalFile(
   }
 
   const outZipPath = `${inputPath}.zip`;
-  await execFileAsync(
-    'python3',
-    [
-      '-c',
-      'import zipfile, sys; z = zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED, compresslevel=6); z.write(sys.argv[2], arcname=sys.argv[3]); z.close()',
-      outZipPath,
-      inputPath,
-      originalFileName,
-    ],
-    { signal, timeout: 300000 }
-  );
+  const ws = fs.createWriteStream(outZipPath);
+  const rs = fs.createReadStream(inputPath);
+  await pipeStreamToZipWritable(rs, ws, originalFileName, signal);
+  await new Promise<void>((resolve, reject) => ws.end((e?: Error | null) => (e ? reject(e) : resolve())));
 
   if (fs.existsSync(outZipPath) && fs.statSync(outZipPath).size > 0) {
     return {
@@ -6061,7 +6238,22 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
       : 'none';
 
   try {
-    const resolved = await resolveTelegramPostLinkIfApplicable(cleanUrl, resolvedFormat, resolvedQuality);
+    // When media compression is selected on serverless (no FFmpeg), automatically target a compact stream quality
+    const hasFfmpeg = compressMode === 'media' ? await isFfmpegAvailable() : false;
+    const effectiveQualityForResolve =
+      resolvedCompress === 'media' && !hasFfmpeg
+        ? resolvedFormat === 'audio'
+          ? '128'
+          : resolvedQuality === '1080' || resolvedQuality === '720'
+          ? '480'
+          : resolvedQuality
+        : resolvedQuality;
+
+    const resolved = await resolveTelegramPostLinkIfApplicable(
+      cleanUrl,
+      resolvedFormat,
+      effectiveQualityForResolve
+    );
     let fileName = (typeof customFileName === 'string' ? customFileName.trim() : '') || '';
     if (!fileName) {
       fileName = resolved.detectedFileName || extractFilenameFromUrl(cleanUrl, resolvedFormat);
@@ -6084,6 +6276,7 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
           Range: 'bytes=0-0',
           'User-Agent':
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          ...(resolved.resolvedUrl.includes('savetube') ? { Referer: 'https://save-tube.com/' } : {}),
           ...(resolved.customHeaders || {}),
         },
         signal: probeController.signal,
@@ -6117,6 +6310,13 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
       clearTimeout(probeTimeout);
     }
 
+    const downloadFileName =
+      resolvedCompress === 'zip' && !fileName.toLowerCase().endsWith('.zip')
+        ? `${fileName}.zip`
+        : resolvedCompress === 'media' && !fileName.includes('(مضغوط)')
+        ? fileName.replace(/(\.[^/.]+)$/, ' (مضغوط)$1')
+        : fileName;
+
     const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const job: TransferJob = {
       id: jobId,
@@ -6124,10 +6324,10 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
       direction: 'to_device',
       protocol: 'http',
       mediaFormat: resolvedFormat,
-      quality: resolvedQuality,
+      quality: effectiveQualityForResolve,
       compressMode: resolvedCompress,
-      fileName,
-      mimeType,
+      fileName: downloadFileName,
+      mimeType: resolvedCompress === 'zip' ? 'application/zip' : mimeType,
       totalBytes,
       bytesTransferred: totalBytes,
       speedBps: 0,
@@ -6143,11 +6343,12 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
     transferJobs.unshift(job);
     saveStateToDisk();
 
-    const safePathName = encodeURIComponent(fileName);
+    const safePathName = encodeURIComponent(downloadFileName);
     const proxyParams = new URLSearchParams({
       jobId: job.id,
+      url: resolved.resolvedUrl,
       format: resolvedFormat,
-      quality: resolvedQuality,
+      quality: effectiveQualityForResolve,
       compress: resolvedCompress,
       name: fileName,
     });
@@ -6156,7 +6357,7 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
     const proxyDownloadUrl = `/api/direct-download/${safePathName}?${proxyParams.toString()}`;
 
     const isDirectAttachmentCdn =
-      resolvedCompress === 'none' &&
+      (resolvedCompress === 'none' || (resolvedCompress === 'media' && !hasFfmpeg)) &&
       /^https:\/\//i.test(resolved.resolvedUrl) &&
       (resolved.resolvedUrl.includes('savetube') ||
         resolved.resolvedUrl.endsWith('.mp4') ||
@@ -6164,8 +6365,8 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
 
     res.json({
       ok: true,
-      fileName,
-      mimeType,
+      fileName: downloadFileName,
+      mimeType: resolvedCompress === 'zip' ? 'application/zip' : mimeType,
       totalBytes,
       directStreamUrl: resolved.resolvedUrl,
       preferDirectCdn: isDirectAttachmentCdn,
@@ -6185,6 +6386,7 @@ app.get(['/api/direct-download', '/api/direct-download/:pathFileName'], async (r
   const rawUrl = typeof req.query.url === 'string' ? extractCleanHttpUrl(req.query.url) : '';
   const driveFileId = typeof req.query.driveFileId === 'string' ? req.query.driveFileId.trim() : '';
   const jobId = typeof req.query.jobId === 'string' ? req.query.jobId.trim() : '';
+  const queryToken = typeof req.query.token === 'string' ? req.query.token.trim() : '';
   const formatParam: 'video' | 'audio' = req.query.format === 'audio' ? 'audio' : 'video';
   const qualityParam =
     typeof req.query.quality === 'string' ? req.query.quality.trim() : ctx.session.defaultQuality || '720';
@@ -6211,19 +6413,19 @@ app.get(['/api/direct-download', '/api/direct-download/:pathFileName'], async (r
   try {
     let targetUrl = rawUrl;
     let targetDriveId = driveFileId;
-    let fileName = customName;
+    let fileName = customName.replace(/\.zip$/i, '');
     let mimeType = formatParam === 'audio' ? 'audio/mpeg' : 'application/octet-stream';
-    let jobSpecificToken: string | null = null;
+    let jobSpecificToken: string | null = queryToken || null;
 
-    if (jobId && !targetUrl && !targetDriveId) {
+    if (jobId) {
       const job = transferJobs.find((j) => j.id === jobId);
       if (job) {
-        if (job.driveFileId) targetDriveId = job.driveFileId;
-        else if (job.directUrl) targetUrl = job.directUrl;
-        if (!fileName) fileName = job.fileName;
-        if (job.mimeType) mimeType = job.mimeType;
+        if (!targetDriveId && job.driveFileId) targetDriveId = job.driveFileId;
+        if (!targetUrl && job.directUrl) targetUrl = job.directUrl;
+        if (!fileName) fileName = job.fileName.replace(/\.zip$/i, '');
+        if (job.mimeType && job.mimeType !== 'application/zip') mimeType = job.mimeType;
         const jobSess = resolveJobDriveSession(job);
-        jobSpecificToken = jobSess.accessToken;
+        if (!jobSpecificToken) jobSpecificToken = jobSess.accessToken;
       }
     }
 
@@ -6278,6 +6480,7 @@ app.get(['/api/direct-download', '/api/direct-download/:pathFileName'], async (r
         headers: {
           'User-Agent':
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          ...(resolved.resolvedUrl.includes('savetube') ? { Referer: 'https://save-tube.com/' } : {}),
           ...(resolved.customHeaders || {}),
         },
       });
@@ -6308,8 +6511,28 @@ app.get(['/api/direct-download', '/api/direct-download/:pathFileName'], async (r
       fileName = `download_${Date.now()}.${formatParam === 'audio' ? 'mp3' : 'mp4'}`;
     }
 
-    // If compression is requested before direct download
-    if (compressParam !== 'none') {
+    // Fast On-the-Fly Streaming ZIP Compression (Zero /tmp disk overhead, zero python3 dependency)
+    if (compressParam === 'zip') {
+      const zipDownloadName = fileName.toLowerCase().endsWith('.zip') ? fileName : `${fileName}.zip`;
+      const asciiZipFallback = zipDownloadName.replace(/[^\x20-\x7E]/g, '_') || 'download.zip';
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${asciiZipFallback}"; filename*=UTF-8''${encodeURIComponent(zipDownloadName)}`
+      );
+
+      await pipeStreamToZipWritable(
+        readableStreamToAsyncIterable(upstreamRes.body),
+        res,
+        fileName,
+        signal
+      );
+      res.end();
+      return;
+    }
+
+    // If FFmpeg media compression is requested and FFmpeg is available on host
+    if (compressParam === 'media' && (await isFfmpegAvailable())) {
       const safeName = fileName.replace(/[^a-zA-Z0-9._\u0600-\u06FF-]/g, '_');
       const rawTemp = path.join('/tmp', `dl_raw_${Date.now()}_${safeName}`);
       tempFilesToClean.push(rawTemp);
@@ -6327,7 +6550,7 @@ app.get(['/api/direct-download', '/api/direct-download/:pathFileName'], async (r
       }
       await new Promise<void>((resolve, reject) => ws.end((e?: Error | null) => (e ? reject(e) : resolve())));
 
-      const comp = await compressLocalFile(rawTemp, fileName, mimeType, compressParam, signal);
+      const comp = await compressLocalFile(rawTemp, fileName, mimeType, 'media', signal);
       if (comp.finalPath !== rawTemp) {
         tempFilesToClean.push(comp.finalPath);
       }

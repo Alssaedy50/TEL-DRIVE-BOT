@@ -839,12 +839,15 @@ export default function App() {
           document.body.removeChild(a);
           setBannerSuccess(`تم تجهيز "${data.fileName}" وبدأ التحميل المباشر إلى جهازك!`);
         } else if (data.proxyDownloadUrl) {
-          setLastDirectDownload({ url: data.proxyDownloadUrl, fileName: data.fileName || 'download' });
-          await handleAuthenticatedProxyDownload(
-            data.proxyDownloadUrl,
-            data.fileName || 'download',
-            data.job?.id || 'direct'
-          );
+          const finalFileName = data.fileName || 'download';
+          setLastDirectDownload({ url: data.proxyDownloadUrl, fileName: finalFileName });
+          const a = document.createElement('a');
+          a.href = data.proxyDownloadUrl;
+          a.download = finalFileName;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setBannerSuccess(`تم ضغط وتجهيز "${finalFileName}" وبدأ التحميل المباشر إلى جهازك!`);
         }
       } catch (err: any) {
         setBannerError(err?.message || 'حدث خطأ أثناء استخراج وتحميل الرابط.');
@@ -1537,6 +1540,7 @@ export default function App() {
                       <div className="flex items-center gap-3">
                         {(job.driveFileId || job.directUrl) &&
                           (!job.driveFileId &&
+                          (!job.compressMode || job.compressMode === 'none') &&
                           job.directUrl &&
                           (job.directUrl.includes('savetube') ||
                             job.directUrl.endsWith('.mp4') ||
@@ -1558,9 +1562,11 @@ export default function App() {
                                 handleAuthenticatedProxyDownload(
                                   `/api/direct-download/${encodeURIComponent(job.fileName)}?jobId=${encodeURIComponent(
                                     job.id
-                                  )}${personalEmail ? `&userEmail=${encodeURIComponent(personalEmail)}` : ''}${
-                                    personalChatId ? `&chatId=${encodeURIComponent(personalChatId)}` : ''
-                                  }`,
+                                  )}${job.directUrl ? `&url=${encodeURIComponent(job.directUrl)}` : ''}${
+                                    job.driveFileId ? `&driveFileId=${encodeURIComponent(job.driveFileId)}` : ''
+                                  }${job.compressMode ? `&compress=${encodeURIComponent(job.compressMode)}` : ''}${
+                                    personalEmail ? `&userEmail=${encodeURIComponent(personalEmail)}` : ''
+                                  }${personalChatId ? `&chatId=${encodeURIComponent(personalChatId)}` : ''}`,
                                   job.fileName,
                                   job.id
                                 )
