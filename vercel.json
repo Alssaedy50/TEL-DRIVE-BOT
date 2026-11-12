@@ -16,7 +16,7 @@
       "destination": "/api/index"
     },
     {
-      "source": "/((?!api/).*)",
+      "source": "/((?!api/|manifest\\.webmanifest|sw\\.js|registerSW\\.js|workbox-.*|icon\\.svg|apple-touch-icon\\.png|pwa-.*|assets/).*)",
       "destination": "/index.html"
     }
   ]

@@ -37,6 +37,10 @@ import {
   FileArchive,
   Film,
   Music,
+  ClipboardPaste,
+  WifiOff,
+  Share2,
+  PlusSquare,
 } from 'lucide-react';
 import {
   listFolders,
@@ -56,6 +60,7 @@ import {
   saveStoredToken,
   clearStoredToken,
 } from './firebase';
+import { usePWAInstall } from './usePWAInstall';
 
 declare global {
   interface Window {
@@ -71,7 +76,7 @@ const STORAGE_CUSTOM_CLIENT_ID_KEY = 'tg_drive_custom_google_client_id';
 const STORAGE_VERCEL_URL_KEY = 'tg_drive_target_vercel_url';
 
 type CompressMode = 'none' | 'zip' | 'media';
-type ModalType = 'menu' | 'drive_files' | 'large_upload' | 'settings' | 'admin' | 'url_options' | null;
+type ModalType = 'menu' | 'drive_files' | 'large_upload' | 'settings' | 'admin' | 'url_options' | 'pwa_install' | null;
 
 interface TransferJob {
   id: string;
@@ -332,14 +337,19 @@ export default function App() {
   const [localUploadProgress, setLocalUploadProgress] = useState(0);
   const [localUploadFileName, setLocalUploadFileName] = useState('');
 
+  // PWA Install & Connectivity state
+  const { isInstallable, isInstalled, isIOS, isOnline, install: triggerPwaInstall } = usePWAInstall();
+
   // Multi-platform URL Uploader state
   const [externalUrlInput, setExternalUrlInput] = useState('');
   const [externalCustomName, setExternalCustomName] = useState('');
-  const [externalDestination, setExternalDestination] = useState<'drive' | 'telegram' | 'device'>('drive');
+  const [externalDestination, setExternalDestination] = useState<'drive' | 'telegram' | 'device'>('device');
   const [externalMediaFormat, setExternalMediaFormat] = useState<'video' | 'audio'>('video');
   const [externalQuality, setExternalQuality] = useState<string>('720');
   const [externalCompressMode, setExternalCompressMode] = useState<CompressMode>('none');
   const [submittingUrl, setSubmittingUrl] = useState(false);
+  const [inspectingUrl, setInspectingUrl] = useState(false);
+  const lastInspectedUrlRef = useRef<string>('');
   const [clearingFailed, setClearingFailed] = useState(false);
   const [downloadingItemId, setDownloadingItemId] = useState<string | null>(null);
   const [lastDirectDownload, setLastDirectDownload] = useState<{ url: string; fileName: string } | null>(null);
@@ -1097,22 +1107,21 @@ export default function App() {
     });
   };
 
-  const handleUrlUploadSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!externalUrlInput.trim()) return;
+  const inspectUrlFormats = useCallback(
+    async (rawUrl: string, fmtOverride?: 'video' | 'audio', qOverride?: string, compOverride?: CompressMode) => {
+      const clean = rawUrl.trim();
+      if (!clean || !/^https?:\/\//i.test(clean)) return null;
 
-    setSubmittingUrl(true);
-    setBannerError(null);
-    setLastDirectDownload(null);
+      setInspectingUrl(true);
+      setBannerError(null);
+      lastInspectedUrlRef.current = clean;
 
-    // Ensure customFileName is not a pasted URL
-    const rawCustom = externalCustomName.trim();
-    const safeCustomName =
-      rawCustom && !/^https?:\/\//i.test(rawCustom) && !/youtu\.?be|tiktok\.com|t\.me|drive\.google/i.test(rawCustom)
-        ? rawCustom
-        : undefined;
+      const rawCustom = externalCustomName.trim();
+      const safeCustomName =
+        rawCustom && !/^https?:\/\//i.test(rawCustom) && !/youtu\.?be|tiktok\.com|t\.me|drive\.google/i.test(rawCustom)
+          ? rawCustom
+          : undefined;
 
-    if (externalDestination === 'device') {
       try {
         const headers: Record<string, string> = { 'Content-Type': 'application/json' };
         if (accessToken) {
@@ -1122,23 +1131,133 @@ export default function App() {
           method: 'POST',
           headers,
           body: JSON.stringify({
-            url: externalUrlInput.trim(),
+            url: clean,
             customFileName: safeCustomName,
-            mediaFormat: externalMediaFormat,
-            quality: externalQuality,
-            compressMode: externalCompressMode,
+            mediaFormat: fmtOverride || externalMediaFormat,
+            quality: qOverride || externalQuality,
+            compressMode: compOverride || externalCompressMode,
             userEmail: personalEmail || undefined,
             targetChatId: personalChatId || undefined,
           }),
         });
-        const data = await parseJsonResponse<ResolvedMediaInfo>(res, 'تعذر استخراج معلومات الرابط والصيغ المتاحة.');
-
+        const data = await parseJsonResponse<ResolvedMediaInfo>(
+          res,
+          'تعذر استخراج معلومات الرابط والصيغ المتاحة.'
+        );
         setResolvedMediaInfo(data);
-        setExternalCustomName('');
-        setBannerSuccess('تم فحص الرابط وتجهيز الصيغ والأحجام المتاحة! اختر الصيغة المطلوبة لبدء التحميل.');
-        setTimeout(() => setBannerSuccess(null), 5000);
+        return data;
       } catch (err: any) {
         setBannerError(err?.message || 'حدث خطأ أثناء فحص الرابط واستخراج الصيغ.');
+        return null;
+      } finally {
+        setInspectingUrl(false);
+      }
+    },
+    [
+      accessToken,
+      externalCustomName,
+      externalMediaFormat,
+      externalQuality,
+      externalCompressMode,
+      personalEmail,
+      personalChatId,
+    ]
+  );
+
+  // Automatically inspect URL and display formats & sizes as soon as a valid link is pasted or typed
+  useEffect(() => {
+    const trimmed = externalUrlInput.trim();
+    if (!trimmed || !/^https?:\/\/\S+\.\S+/i.test(trimmed)) {
+      if (!trimmed) {
+        setResolvedMediaInfo(null);
+        lastInspectedUrlRef.current = '';
+      }
+      return;
+    }
+    if (trimmed === lastInspectedUrlRef.current && resolvedMediaInfo) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      inspectUrlFormats(trimmed);
+    }, 350);
+    return () => clearTimeout(timer);
+  }, [externalUrlInput, inspectUrlFormats, resolvedMediaInfo]);
+
+  const handlePasteFromClipboard = async () => {
+    setBannerError(null);
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text && text.trim()) {
+        const clean = text.trim();
+        setExternalUrlInput(clean);
+        if (/^https?:\/\//i.test(clean)) {
+          await inspectUrlFormats(clean);
+        }
+      }
+    } catch {
+      setBannerError('يرجى اللصق يدوياً داخل حقل الرابط أو السماح بصلاحية الحافظة.');
+    }
+  };
+
+  const handleUrlUploadSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!externalUrlInput.trim()) return;
+
+    setSubmittingUrl(true);
+    setBannerError(null);
+    setLastDirectDownload(null);
+
+    const rawCustom = externalCustomName.trim();
+    const safeCustomName =
+      rawCustom && !/^https?:\/\//i.test(rawCustom) && !/youtu\.?be|tiktok\.com|t\.me|drive\.google/i.test(rawCustom)
+        ? rawCustom
+        : undefined;
+
+    if (externalDestination === 'device') {
+      try {
+        let info = resolvedMediaInfo;
+        if (!info || lastInspectedUrlRef.current !== externalUrlInput.trim()) {
+          info = await inspectUrlFormats(externalUrlInput.trim());
+        }
+        if (!info) return;
+
+        // Find matching format from availableFormats based on user's selected format & quality
+        const matchedFmt =
+          info.availableFormats.find(
+            (f) => f.format === externalMediaFormat && f.quality === externalQuality
+          ) ||
+          info.availableFormats.find((f) => f.format === externalMediaFormat) ||
+          info.availableFormats[0];
+
+        if (matchedFmt) {
+          const isZip = externalCompressMode === 'zip';
+          const customBase = safeCustomName ? safeCustomName.replace(/\.[^/.]+$/, '') : '';
+          const targetFileName = customBase
+            ? `${customBase}.${isZip ? `${matchedFmt.ext}.zip` : matchedFmt.ext}`
+            : isZip
+              ? matchedFmt.zipFileName
+              : matchedFmt.fileName;
+
+          await startInAppStreamDownload({
+            downloadUrl: isZip ? matchedFmt.zipDownloadUrl : matchedFmt.downloadUrl,
+            fileName: targetFileName,
+            formatLabel: isZip ? `${matchedFmt.label} (ZIP)` : matchedFmt.label,
+            compressMode: isZip ? 'zip' : matchedFmt.savedPercent > 0 ? 'media' : externalCompressMode,
+            expectedBytes: isZip ? Math.round(matchedFmt.sizeBytes * 0.94) : matchedFmt.sizeBytes,
+            originalBytes: info.originalSizeBytes || matchedFmt.sizeBytes,
+          });
+        } else {
+          await startInAppStreamDownload({
+            downloadUrl: info.proxyDownloadUrl,
+            fileName: info.fileName,
+            formatLabel: externalMediaFormat === 'audio' ? `MP3 • ${externalQuality}kbps` : `MP4 • ${externalQuality}p`,
+            compressMode: externalCompressMode,
+            expectedBytes: info.compressedSizeBytes || info.sizeBytes,
+            originalBytes: info.originalSizeBytes || info.sizeBytes,
+          });
+        }
+      } catch (err: any) {
+        setBannerError(err?.message || 'حدث خطأ أثناء بدء التحميل المباشر.');
       } finally {
         setSubmittingUrl(false);
       }
@@ -1155,7 +1274,7 @@ export default function App() {
         headers,
         body: JSON.stringify({
           url: externalUrlInput.trim(),
-          customFileName: externalCustomName.trim() || undefined,
+          customFileName: safeCustomName,
           destination: externalDestination,
           mediaFormat: externalMediaFormat,
           quality: externalQuality,
@@ -1164,13 +1283,15 @@ export default function App() {
           targetChatId: personalChatId || undefined,
         }),
       });
-      const data = await parseJsonResponse(res, 'تعذر إضافة الرابط للتحويل.');
+      await parseJsonResponse(res, 'تعذر إضافة الرابط للتحويل.');
       setExternalUrlInput('');
       setExternalCustomName('');
+      setResolvedMediaInfo(null);
+      lastInspectedUrlRef.current = '';
       setBannerSuccess(
         externalDestination === 'telegram'
-          ? 'تم بدء سحب الرابط وإرساله كملف إلى محادثتك في تليجرام!'
-          : 'تمت إضافة الرابط لطابور الرفع إلى حسابك الشخصي في Google Drive!'
+          ? 'تم بدء سحب الرابط بالصيغة والدقة المختارة وإرساله إلى محادثتك في تليجرام!'
+          : 'تمت إضافة الرابط بالصيغة والدقة المختارة لطابور الرفع إلى Google Drive!'
       );
       setTimeout(() => setBannerSuccess(null), 4000);
       fetchStatus();
@@ -1422,38 +1543,135 @@ export default function App() {
   const telegramDeepLink =
     botUsername && linkCode ? `https://t.me/${botUsername}?start=link_${linkCode}` : botUsername ? `https://t.me/${botUsername}` : '';
 
-  const compressLabel =
-    externalCompressMode === 'zip' ? 'ZIP' : externalCompressMode === 'media' ? 'ضغط FFmpeg' : 'بدون ضغط';
+  const selectedResolvedFormatObj = resolvedMediaInfo?.availableFormats?.find(
+    (f) => f.format === externalMediaFormat && f.quality === externalQuality
+  ) || resolvedMediaInfo?.availableFormats?.find((f) => f.format === externalMediaFormat);
+
+  const selectedEffectiveBytes = selectedResolvedFormatObj
+    ? externalCompressMode === 'zip'
+      ? Math.round(selectedResolvedFormatObj.sizeBytes * 0.94)
+      : selectedResolvedFormatObj.sizeBytes
+    : resolvedMediaInfo?.compressedSizeBytes || resolvedMediaInfo?.sizeBytes || 0;
+
+  const selectedOriginalBytes =
+    resolvedMediaInfo?.originalSizeBytes || selectedResolvedFormatObj?.sizeBytes || 0;
+
+  const selectedSavedBytes =
+    selectedOriginalBytes > selectedEffectiveBytes && selectedEffectiveBytes > 0
+      ? selectedOriginalBytes - selectedEffectiveBytes
+      : 0;
+
+  const selectedSavedPercent =
+    selectedOriginalBytes > 0 && selectedSavedBytes > 0
+      ? Math.round((selectedSavedBytes / selectedOriginalBytes) * 100)
+      : 0;
+
+  const handleInstallButtonClick = async () => {
+    if (isInstallable) {
+      const accepted = await triggerPwaInstall();
+      if (accepted) {
+        setBannerSuccess('تم تثبيت التطبيق على شاشة هاتفك بنجاح!');
+        setTimeout(() => setBannerSuccess(null), 4000);
+        return;
+      }
+    }
+    setActiveModal('pwa_install');
+  };
+
+  const videoQualityPresets = [
+    { q: '1080', title: '1080p Full HD', desc: 'أعلى دقة ووضوح' },
+    { q: '720', title: '720p HD', desc: 'جودة عالية متوازنة' },
+    { q: '480', title: '480p SD', desc: 'حجم متوسط (~70% توفير)' },
+    { q: '360', title: '360p خفيف', desc: 'سريع (~81% توفير)' },
+    { q: '240', title: '240p اقتصادي', desc: 'أقل بيانات (~88% توفير)' },
+  ];
+
+  const audioQualityPresets = [
+    { q: '320', title: '320kbps فائق', desc: 'أعلى نقاء صوتي' },
+    { q: '192', title: '192kbps متوازن', desc: 'جودة ممتازة وحجم مناسب' },
+    { q: '128', title: '128kbps خفيف', desc: 'أصغر حجم صوتي (~94% توفير)' },
+  ];
 
   return (
     <div dir="rtl" className="min-h-screen w-full max-w-full overflow-x-hidden bg-[#090D16] text-slate-100 font-sans flex flex-col">
-      {/* Ultra-Clean Fixed Top Header: Only Brand + Single Popup Menu Trigger */}
+      {/* Sticky Top App Bar — Clean 3-Zone Mobile & Desktop Contract */}
       <header className="w-full px-4 sm:px-6 py-3 border-b border-slate-800/80 bg-[#0D1322]/95 backdrop-blur-md sticky top-0 z-30">
-        <div className="max-w-4xl mx-auto flex items-center justify-between gap-3">
-          {/* Brand Title */}
-          <div className="flex items-center gap-2.5 min-w-0">
-            <div className="w-8 h-8 rounded-lg bg-sky-500/15 border border-sky-500/30 flex items-center justify-center text-sky-400 shrink-0">
-              <Send className="w-4 h-4" />
-            </div>
-            <span className="text-base font-bold text-white tracking-tight truncate">
-              TeleDrive Cloud
-            </span>
-          </div>
+        <div className="max-w-5xl mx-auto flex items-center justify-between gap-4">
+          {/* Zone 1: Brand Wordmark */}
+          <a href="/" className="text-base sm:text-lg font-bold text-white tracking-tight whitespace-nowrap shrink-0">
+            TeleDrive Cloud
+          </a>
 
-          {/* Single Popup Menu Button — Hides All Top Options Inside a Popup Menu */}
-          <button
-            type="button"
-            onClick={() => setActiveModal('menu')}
-            className="px-3.5 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold flex items-center gap-2 transition cursor-pointer shrink-0 shadow-sm"
-          >
-            <Menu className="w-4 h-4 shrink-0" />
-            <span>القائمة والخيارات</span>
-          </button>
+          {/* Zone 2: Quick Navigation Links (Desktop) */}
+          <nav className="hidden md:flex items-center gap-6 text-xs font-medium text-slate-300">
+            <button
+              type="button"
+              onClick={() => setActiveModal('settings')}
+              className="hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              إعدادات الحساب والربط
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setActiveModal('drive_files');
+                if (accessToken) refreshDriveFoldersAndFiles();
+              }}
+              className="hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              ملفاتي في Drive
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveModal('large_upload')}
+              className="hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              رفع ملف ضخم
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveModal('admin')}
+              className="hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              إدارة البوت
+            </button>
+          </nav>
+
+          {/* Zone 3: Primary Actions (Install App + Menu) */}
+          <div className="flex items-center gap-2 shrink-0">
+            {!isInstalled && (
+              <button
+                type="button"
+                onClick={handleInstallButtonClick}
+                className="min-h-[40px] px-3 sm:px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer whitespace-nowrap shrink-0 shadow-sm"
+              >
+                <Smartphone className="w-3.5 h-3.5 shrink-0" />
+                <span>تثبيت التطبيق</span>
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={() => setActiveModal('menu')}
+              className="min-h-[40px] px-3.5 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer whitespace-nowrap shrink-0 shadow-sm"
+            >
+              <Menu className="w-4 h-4 shrink-0" />
+              <span>القائمة</span>
+            </button>
+          </div>
         </div>
       </header>
 
-      {/* Main Focused Workspace — Locked Width, Zero Horizontal Scroll */}
-      <main className="flex-1 w-full max-w-4xl mx-auto px-3.5 sm:px-6 py-4 sm:py-6 space-y-4">
+      {/* Offline Connectivity Banner */}
+      {!isOnline && (
+        <div className="w-full bg-amber-950/90 border-b border-amber-500/40 px-4 py-2 text-center text-xs text-amber-200 flex items-center justify-center gap-2">
+          <WifiOff className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+          <span>أنت الآن في وضع عدم الاتصال بالإنترنت — يتم عرض الواجهة المخزنة محلياً.</span>
+        </div>
+      )}
+
+      {/* Main Workspace */}
+      <main className="flex-1 w-full max-w-5xl mx-auto px-3.5 sm:px-6 py-4 sm:py-6 space-y-5">
         {/* Notification Banners */}
         {bannerError && (
           <div className="p-3.5 rounded-xl bg-rose-950/70 border border-rose-500/40 text-rose-200 flex items-center justify-between gap-3">
@@ -1461,7 +1679,10 @@ export default function App() {
               <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
               <span className="break-words">{bannerError}</span>
             </div>
-            <button onClick={() => setBannerError(null)} className="text-xs text-rose-300 hover:text-white shrink-0 cursor-pointer">
+            <button
+              onClick={() => setBannerError(null)}
+              className="min-h-[36px] px-2.5 text-xs text-rose-300 hover:text-white shrink-0 cursor-pointer"
+            >
               إغلاق
             </button>
           </div>
@@ -1479,7 +1700,7 @@ export default function App() {
                   href={lastDirectDownload.url}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="px-3 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center gap-1.5"
+                  className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center gap-1.5 whitespace-nowrap"
                 >
                   <Download className="w-3.5 h-3.5" />
                   <span>تنزيل مباشر</span>
@@ -1490,7 +1711,7 @@ export default function App() {
                   setBannerSuccess(null);
                   setLastDirectDownload(null);
                 }}
-                className="text-xs text-emerald-300 hover:text-white cursor-pointer"
+                className="min-h-[36px] px-2.5 text-xs text-emerald-300 hover:text-white cursor-pointer"
               >
                 إغلاق
               </button>
@@ -1498,118 +1719,449 @@ export default function App() {
           </div>
         )}
 
-        {/* Interactive Account Summary Strip (Opens Settings Popup When Tapped) */}
-        <button
-          type="button"
-          onClick={() => setActiveModal('settings')}
-          className="w-full text-right px-4 py-3 rounded-xl bg-[#0D1322] hover:bg-slate-900/90 border border-slate-800/90 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400 cursor-pointer transition"
-        >
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 min-w-0">
-            <span className={driveConnected ? 'text-emerald-300 font-semibold' : 'text-amber-300 font-semibold'}>
+        {/* Clean Unboxed Account & Status Bar */}
+        <div className="w-full px-4 py-3 rounded-2xl bg-[#0F1626] border border-slate-800/80 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-400">
+          <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 min-w-0">
+            <button
+              type="button"
+              onClick={() => setActiveModal('settings')}
+              className={`font-semibold hover:underline cursor-pointer ${
+                driveConnected ? 'text-emerald-400' : 'text-amber-400'
+              }`}
+            >
               {driveConnected
-                ? `حسابك: ${effectiveUserEmail || effectiveUserName}`
-                : 'اضغط هنا لربط Google Drive وتليجرام'}
-            </span>
+                ? `حساب Drive: ${effectiveUserEmail || effectiveUserName}`
+                : 'اضغط لربط حساب Google Drive وتليجرام'}
+            </button>
             <span aria-hidden="true">·</span>
             <span className="truncate">
-              المجلد: <strong className="text-slate-200">{serverStatus?.drive.activeFolderName || selectedFolderName}</strong>
+              المجلد: <strong className="text-slate-200 font-medium">{serverStatus?.drive.activeFolderName || selectedFolderName}</strong>
             </span>
             <span aria-hidden="true">·</span>
             <span>
-              تليجرام: <strong className="text-slate-200">{linkedChatId ? `مربوط (#${linkedChatId})` : 'غير مربوط'}</strong>
+              تليجرام: <strong className="text-slate-200 font-medium">{linkedChatId ? `مربوط (#${linkedChatId})` : 'غير مربوط'}</strong>
             </span>
           </div>
 
-          <div className="flex items-center gap-2 tabular-nums text-slate-300">
+          <div className="flex items-center gap-2.5 tabular-nums text-slate-300">
             <span>المكتملة: {serverStatus?.stats.completedJobs ?? 0}</span>
             <span aria-hidden="true">·</span>
             <span>الجارية: {serverStatus?.stats.activeJobs ?? 0}</span>
             <span aria-hidden="true">·</span>
             <span dir="ltr">{formatBytes(serverStatus?.stats.totalBytesTransferred ?? 0)}</span>
           </div>
-        </button>
+        </div>
 
-        {/* Core Card 1: Multi-Platform URL & Video Puller */}
-        <section className="w-full bg-[#0D1322] border border-slate-800/90 rounded-2xl p-4 sm:p-6 space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        {/* =====================================================================
+            CORE CARD 1: PASTE LINK -> DIRECT INLINE FORMAT, RESOLUTION & SIZE
+           ===================================================================== */}
+        <section className="w-full bg-[#0F1626] border border-slate-800/90 rounded-2xl p-4 sm:p-6 space-y-5 shadow-lg">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-800/70 pb-3.5">
             <div>
-              <h1 className="text-base sm:text-lg font-bold text-white">
+              <h1 className="text-base sm:text-xl font-bold text-white tracking-tight">
                 سحب وتحميل الفيديوهات والملفات عبر الروابط
               </h1>
-              <p className="text-xs text-slate-400 mt-0.5">
-                يدعم YouTube و TikTok و Google Drive و MediaFire و Dropbox والروابط المباشرة
+              <p className="text-xs text-slate-400 mt-1">
+                الصق رابط YouTube أو TikTok أو Google Drive أو MediaFire واختر الصيغة والدقة والحجم مباشرة بالأسفل
               </p>
             </div>
-
-            {/* Popup Trigger for Extraction Quality & Compression Options */}
-            <button
-              type="button"
-              onClick={() => setActiveModal('url_options')}
-              className="self-start sm:self-auto px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700/80 text-slate-200 text-xs font-medium flex items-center gap-2 transition cursor-pointer shrink-0"
-            >
-              <Sliders className="w-3.5 h-3.5 text-sky-400 shrink-0" />
-              <span>
-                خيارات السحب: {externalMediaFormat === 'audio' ? `MP3 (${externalQuality}k)` : `MP4 (${externalQuality}p)`} · {compressLabel}
-              </span>
-            </button>
+            {inspectingUrl && (
+              <div className="flex items-center gap-2 text-xs text-sky-400 font-medium shrink-0">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span>جاري فحص الرابط وحساب الأحجام...</span>
+              </div>
+            )}
           </div>
 
-          <form onSubmit={handleUrlUploadSubmit} className="space-y-3.5">
-            {/* Destination Segmented Control */}
-            <div className="grid grid-cols-3 gap-1.5 p-1 rounded-xl bg-slate-950 border border-slate-800/80">
-              <button
-                type="button"
-                onClick={() => setExternalDestination('drive')}
-                className={`py-2 px-1.5 rounded-lg text-xs font-semibold flex items-center justify-center gap-1 transition cursor-pointer ${
-                  externalDestination === 'drive'
-                    ? 'bg-emerald-600 text-white shadow-sm'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <HardDrive className="w-3.5 h-3.5 shrink-0" />
-                <span>إلى Drive</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setExternalDestination('telegram')}
-                className={`py-2 px-1.5 rounded-lg text-xs font-semibold flex items-center justify-center gap-1 transition cursor-pointer ${
-                  externalDestination === 'telegram'
-                    ? 'bg-sky-600 text-white shadow-sm'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Smartphone className="w-3.5 h-3.5 shrink-0" />
-                <span>إلى تليجرام</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setExternalDestination('device')}
-                className={`py-2 px-1.5 rounded-lg text-xs font-semibold flex items-center justify-center gap-1 transition cursor-pointer ${
-                  externalDestination === 'device'
-                    ? 'bg-indigo-600 text-white shadow-sm'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Download className="w-3.5 h-3.5 shrink-0" />
-                <span>لجهازي</span>
-              </button>
+          <form onSubmit={handleUrlUploadSubmit} className="space-y-5">
+            {/* STEP 1: URL Input with 1-Tap Paste & Auto-Detection */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <label className="text-xs font-semibold text-slate-200">
+                  1. الصق رابط الفيديو أو الملف هنا
+                </label>
+                {externalUrlInput.trim() && (
+                  <button
+                    type="button"
+                    onClick={() => inspectUrlFormats(externalUrlInput)}
+                    disabled={inspectingUrl}
+                    className="text-xs text-sky-400 hover:text-sky-300 font-medium flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                  >
+                    <RefreshCw className={`w-3 h-3 ${inspectingUrl ? 'animate-spin' : ''}`} />
+                    <span>تحديث فحص الصيغ والأحجام</span>
+                  </button>
+                )}
+              </div>
+
+              <div className="flex flex-col sm:flex-row gap-2">
+                <div className="relative flex-1 flex items-center">
+                  <input
+                    type="text"
+                    required
+                    dir="ltr"
+                    value={externalUrlInput}
+                    onChange={(e) => setExternalUrlInput(e.target.value)}
+                    onPaste={(e) => {
+                      const pasted = e.clipboardData?.getData('text')?.trim();
+                      if (pasted && /^https?:\/\//i.test(pasted)) {
+                        setTimeout(() => inspectUrlFormats(pasted), 50);
+                      }
+                    }}
+                    placeholder="https://youtube.com/watch?v=... أو رابط TikTok / Drive / MediaFire..."
+                    className="w-full min-h-[46px] pl-3.5 pr-10 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-sky-500 transition"
+                  />
+                  {externalUrlInput && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setExternalUrlInput('');
+                        setResolvedMediaInfo(null);
+                        lastInspectedUrlRef.current = '';
+                      }}
+                      className="absolute right-2.5 p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer"
+                      title="مسح الرابط"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={handlePasteFromClipboard}
+                  className="min-h-[46px] px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700/80 text-slate-200 text-xs font-semibold flex items-center justify-center gap-2 transition cursor-pointer shrink-0 whitespace-nowrap"
+                >
+                  <ClipboardPaste className="w-4 h-4 text-sky-400 shrink-0" />
+                  <span>لصق الرابط وفحصه</span>
+                </button>
+              </div>
             </div>
 
-            {/* URL Input & Single Submit Button */}
-            <div className="flex flex-col sm:flex-row gap-2.5">
-              <input
-                type="text"
-                required
-                dir="ltr"
-                value={externalUrlInput}
-                onChange={(e) => setExternalUrlInput(e.target.value)}
-                placeholder="https://www.youtube.com/watch?v=... أو رابط TikTok / Drive / MediaFire..."
-                className="w-full flex-1 px-4 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-sky-500"
-              />
+            {/* STEP 2: DIRECT INLINE FORMAT, RESOLUTION & FILE SIZE SELECTOR (Immediately after pasting URL) */}
+            <div className="p-4 sm:p-5 rounded-2xl bg-slate-950/80 border border-slate-800/90 space-y-4">
+              {/* Top Row: Format Switcher (Video MP4 vs Audio MP3) + Inspected Media Title */}
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="space-y-0.5 min-w-0">
+                  <span className="text-xs font-bold text-white block">
+                    2. اختر صيغة التحميل والدقة والحجم المناسب
+                  </span>
+                  {resolvedMediaInfo ? (
+                    <p className="text-xs text-emerald-400 font-medium truncate">
+                      {resolvedMediaInfo.platformName}
+                      {resolvedMediaInfo.durationSec > 0
+                        ? ` · ${Math.floor(resolvedMediaInfo.durationSec / 60)}:${String(
+                            resolvedMediaInfo.durationSec % 60
+                          ).padStart(2, '0')} دقيقة`
+                        : ''}{' '}
+                      · <span className="text-slate-200">{resolvedMediaInfo.title}</span>
+                    </p>
+                  ) : (
+                    <p className="text-[11px] text-slate-400">
+                      حدّد صيغة الفيديو (MP4) أو الصوت (MP3) والدقة المطلوبة — تظهر الأحجام الدقيقة فور لصق الرابط
+                    </p>
+                  )}
+                </div>
+
+                {/* Format Segmented Toggle: MP4 Video | MP3 Audio */}
+                <div className="grid grid-cols-2 gap-1.5 p-1 rounded-xl bg-slate-900 border border-slate-800 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setExternalMediaFormat('video');
+                      if (!['1080', '720', '480', '360', '240'].includes(externalQuality)) {
+                        setExternalQuality('720');
+                      }
+                    }}
+                    className={`min-h-[38px] px-3.5 py-1.5 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer whitespace-nowrap ${
+                      externalMediaFormat === 'video'
+                        ? 'bg-sky-600 text-white shadow-sm'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    <Film className="w-3.5 h-3.5 shrink-0" />
+                    <span>فيديو (MP4)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setExternalMediaFormat('audio');
+                      if (!['320', '192', '128'].includes(externalQuality)) {
+                        setExternalQuality('320');
+                      }
+                    }}
+                    className={`min-h-[38px] px-3.5 py-1.5 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer whitespace-nowrap ${
+                      externalMediaFormat === 'audio'
+                        ? 'bg-indigo-600 text-white shadow-sm'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    <Music className="w-3.5 h-3.5 shrink-0" />
+                    <span>صوت فقط (MP3)</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Resolution & Exact Size Grid */}
+              {resolvedMediaInfo && resolvedMediaInfo.availableFormats.length > 0 ? (
+                <div className="space-y-3">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    {resolvedMediaInfo.availableFormats
+                      .filter((fmt) =>
+                        resolvedMediaInfo.isVideoPlatform ? fmt.format === externalMediaFormat : true
+                      )
+                      .map((fmt) => {
+                        const isChosen =
+                          externalMediaFormat === fmt.format &&
+                          (externalQuality === fmt.quality || fmt.quality === 'original');
+                        const displayBytes =
+                          externalCompressMode === 'zip' && fmt.sizeBytes > 0
+                            ? Math.round(fmt.sizeBytes * 0.94)
+                            : fmt.sizeBytes;
+
+                        return (
+                          <div
+                            key={fmt.id}
+                            onClick={() => {
+                              setExternalMediaFormat(fmt.format);
+                              if (fmt.quality !== 'original') {
+                                setExternalQuality(fmt.quality);
+                              }
+                            }}
+                            className={`p-3.5 rounded-xl border transition cursor-pointer flex items-center justify-between gap-3 ${
+                              isChosen
+                                ? 'bg-sky-500/15 border-sky-500 text-white shadow-sm'
+                                : 'bg-slate-900/70 border-slate-800/90 hover:border-slate-700 text-slate-200'
+                            }`}
+                          >
+                            <div className="min-w-0 flex-1 space-y-1">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="text-xs sm:text-sm font-bold text-white">
+                                  {fmt.label}
+                                </span>
+                                {isChosen && (
+                                  <span className="text-[11px] font-semibold text-sky-400">
+                                    ✓ محدد
+                                  </span>
+                                )}
+                              </div>
+                              <div className="flex items-center gap-1.5 text-[11px] text-slate-400 tabular-nums flex-wrap">
+                                <span>{fmt.badge}</span>
+                                {fmt.savedPercent > 0 && (
+                                  <>
+                                    <span aria-hidden="true">·</span>
+                                    <span className="text-emerald-400 font-semibold">
+                                      توفير {fmt.savedPercent}%
+                                    </span>
+                                  </>
+                                )}
+                              </div>
+                            </div>
+
+                            {/* Right Side: Exact File Size + 1-Tap Quick Download */}
+                            <div className="flex items-center gap-2 shrink-0">
+                              <div className="text-left">
+                                <span
+                                  className={`block text-xs sm:text-sm font-bold font-mono tabular-nums ${
+                                    isChosen ? 'text-sky-300' : 'text-white'
+                                  }`}
+                                  dir="ltr"
+                                >
+                                  {displayBytes > 0 ? formatBytes(displayBytes) : 'تلقائي'}
+                                </span>
+                                {externalCompressMode === 'zip' && (
+                                  <span className="block text-[10px] text-emerald-400 font-medium">
+                                    مضغوط ZIP
+                                  </span>
+                                )}
+                              </div>
+
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setExternalMediaFormat(fmt.format);
+                                  if (fmt.quality !== 'original') {
+                                    setExternalQuality(fmt.quality);
+                                  }
+                                  const isZip = externalCompressMode === 'zip';
+                                  startInAppStreamDownload({
+                                    downloadUrl: isZip ? fmt.zipDownloadUrl : fmt.downloadUrl,
+                                    fileName: isZip ? fmt.zipFileName : fmt.fileName,
+                                    formatLabel: isZip ? `${fmt.label} (ZIP)` : fmt.label,
+                                    compressMode: isZip ? 'zip' : fmt.savedPercent > 0 ? 'media' : 'none',
+                                    expectedBytes: displayBytes,
+                                    originalBytes: resolvedMediaInfo.originalSizeBytes || fmt.sizeBytes,
+                                  });
+                                }}
+                                className="min-h-[38px] min-w-[38px] px-2.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold flex items-center justify-center gap-1 transition cursor-pointer shrink-0"
+                                title="تحميل مباشر بهذه الصيغة والحجم"
+                              >
+                                <Download className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                  </div>
+                </div>
+              ) : (
+                /* Pre-Inspection Direct Resolution Picker (Visible before or while link is being inspected) */
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                  {(externalMediaFormat === 'video' ? videoQualityPresets : audioQualityPresets).map(
+                    (preset) => {
+                      const active = externalQuality === preset.q;
+                      return (
+                        <button
+                          key={preset.q}
+                          type="button"
+                          onClick={() => setExternalQuality(preset.q)}
+                          className={`min-h-[54px] p-2.5 rounded-xl border text-right transition cursor-pointer flex flex-col justify-between ${
+                            active
+                              ? 'bg-sky-500/15 border-sky-500 text-white'
+                              : 'bg-slate-900/70 border-slate-800/90 hover:border-slate-700 text-slate-300'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-1 w-full">
+                            <span className="text-xs font-bold text-white">{preset.title}</span>
+                            {active && <Check className="w-3.5 h-3.5 text-sky-400 shrink-0" />}
+                          </div>
+                          <span className="text-[10px] text-slate-400 mt-1">{preset.desc}</span>
+                        </button>
+                      );
+                    }
+                  )}
+                </div>
+              )}
+
+              {/* Compression Mode & Custom Filename Row */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2 border-t border-slate-800/80">
+                <div className="space-y-1.5">
+                  <label className="block text-[11px] font-semibold text-slate-300">
+                    خيار ضغط الحجم قبل التحميل أو النقل
+                  </label>
+                  <div className="grid grid-cols-3 gap-1.5 p-1 rounded-xl bg-slate-900 border border-slate-800">
+                    <button
+                      type="button"
+                      onClick={() => setExternalCompressMode('none')}
+                      className={`min-h-[36px] px-2 py-1 rounded-lg text-[11px] font-semibold transition cursor-pointer whitespace-nowrap ${
+                        externalCompressMode === 'none'
+                          ? 'bg-slate-800 text-white shadow-sm'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      الحجم الأصلي
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setExternalCompressMode('media')}
+                      className={`min-h-[36px] px-2 py-1 rounded-lg text-[11px] font-semibold transition cursor-pointer whitespace-nowrap ${
+                        externalCompressMode === 'media'
+                          ? 'bg-emerald-600 text-white shadow-sm'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      تقليص الحجم
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setExternalCompressMode('zip')}
+                      className={`min-h-[36px] px-2 py-1 rounded-lg text-[11px] font-semibold transition cursor-pointer whitespace-nowrap ${
+                        externalCompressMode === 'zip'
+                          ? 'bg-indigo-600 text-white shadow-sm'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      ضغط ZIP
+                    </button>
+                  </div>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="block text-[11px] font-semibold text-slate-300">
+                    اسم مخصص للملف (اختياري)
+                  </label>
+                  <input
+                    type="text"
+                    value={externalCustomName}
+                    onChange={(e) => setExternalCustomName(e.target.value)}
+                    placeholder="اتركه فارغاً لاستخدام عنوان الفيديو الأصلي"
+                    className="w-full min-h-[44px] px-3.5 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-sky-500"
+                  />
+                </div>
+              </div>
+
+              {/* Live Size Summary Strip when URL is resolved */}
+              {resolvedMediaInfo && selectedEffectiveBytes > 0 && (
+                <div className="pt-2 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-300 tabular-nums">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span>
+                      الحجم الأصلي الكامل:{' '}
+                      <strong className="text-slate-200 font-mono" dir="ltr">
+                        {formatBytes(selectedOriginalBytes)}
+                      </strong>
+                    </span>
+                    <span aria-hidden="true">·</span>
+                    <span>
+                      حجم اختيارك الحالي:{' '}
+                      <strong className="text-emerald-400 font-mono" dir="ltr">
+                        {formatBytes(selectedEffectiveBytes)}
+                      </strong>
+                    </span>
+                  </div>
+                  {selectedSavedBytes > 0 && (
+                    <span className="text-emerald-400 font-semibold">
+                      توفير مسبق: {formatBytes(selectedSavedBytes)} ({selectedSavedPercent}%)
+                    </span>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* STEP 3: Destination Selection & Primary Submit Button */}
+            <div className="space-y-3">
+              <div className="grid grid-cols-3 gap-2 p-1.5 rounded-xl bg-slate-950 border border-slate-800/90">
+                <button
+                  type="button"
+                  onClick={() => setExternalDestination('device')}
+                  className={`min-h-[42px] py-2 px-2 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer whitespace-nowrap ${
+                    externalDestination === 'device'
+                      ? 'bg-sky-600 text-white shadow-sm'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <Download className="w-3.5 h-3.5 shrink-0" />
+                  <span>تحميل لجهازي</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setExternalDestination('telegram')}
+                  className={`min-h-[42px] py-2 px-2 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer whitespace-nowrap ${
+                    externalDestination === 'telegram'
+                      ? 'bg-indigo-600 text-white shadow-sm'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <Smartphone className="w-3.5 h-3.5 shrink-0" />
+                  <span>إلى تليجرام</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setExternalDestination('drive')}
+                  className={`min-h-[42px] py-2 px-2 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer whitespace-nowrap ${
+                    externalDestination === 'drive'
+                      ? 'bg-emerald-600 text-white shadow-sm'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <HardDrive className="w-3.5 h-3.5 shrink-0" />
+                  <span>إلى Drive</span>
+                </button>
+              </div>
+
               <button
                 type="submit"
                 disabled={submittingUrl || !externalUrlInput.trim()}
-                className="w-full sm:w-auto px-6 py-2.5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-semibold text-sm transition flex items-center justify-center gap-2 shrink-0 cursor-pointer disabled:opacity-50"
+                className="w-full min-h-[48px] px-6 py-3 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-bold text-sm transition flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 shadow-md"
               >
                 {submittingUrl ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
@@ -1621,7 +2173,17 @@ export default function App() {
                   <UploadCloud className="w-4 h-4" />
                 )}
                 <span>
-                  {externalDestination === 'device' ? 'فحص الرابط وعرض الصيغ والأحجام' : 'بدء التنفيذ'}
+                  {externalDestination === 'device'
+                    ? `تحميل لجهازي الآن (${
+                        externalMediaFormat === 'audio' ? `MP3 • ${externalQuality}kbps` : `MP4 • ${externalQuality}p`
+                      }${selectedEffectiveBytes > 0 ? ` — ${formatBytes(selectedEffectiveBytes)}` : ''})`
+                    : externalDestination === 'telegram'
+                      ? `إرسال لتليجرام (${
+                          externalMediaFormat === 'audio' ? `MP3 • ${externalQuality}kbps` : `MP4 • ${externalQuality}p`
+                        }${selectedEffectiveBytes > 0 ? ` — ${formatBytes(selectedEffectiveBytes)}` : ''})`
+                      : `رفع إلى Google Drive (${
+                          externalMediaFormat === 'audio' ? `MP3 • ${externalQuality}kbps` : `MP4 • ${externalQuality}p`
+                        }${selectedEffectiveBytes > 0 ? ` — ${formatBytes(selectedEffectiveBytes)}` : ''})`}
                 </span>
               </button>
             </div>
@@ -1629,7 +2191,7 @@ export default function App() {
 
           {/* In-App Live Download Progress Bar with Pause / Resume / Cancel */}
           {inAppDownload && (
-            <div className="mt-4 p-4 rounded-2xl bg-slate-950/90 border border-sky-500/40 space-y-3 shadow-lg">
+            <div className="p-4 rounded-2xl bg-slate-950/90 border border-sky-500/40 space-y-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-2.5 min-w-0">
                   <div
@@ -1654,8 +2216,8 @@ export default function App() {
                     )}
                   </div>
                   <div className="min-w-0">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className="text-xs font-bold text-sky-300">
+                    <div className="flex items-center gap-2 flex-wrap text-xs text-slate-300">
+                      <span className="font-bold text-sky-300">
                         {inAppDownload.status === 'downloading'
                           ? 'جاري التحميل داخل التطبيق...'
                           : inAppDownload.status === 'paused'
@@ -1666,14 +2228,8 @@ export default function App() {
                                 ? 'تم إلغاء التحميل'
                                 : 'فشل التحميل'}
                       </span>
-                      <span className="px-2 py-0.5 rounded-md bg-slate-800 text-[11px] text-slate-300 font-medium">
-                        {inAppDownload.formatLabel}
-                      </span>
-                      {inAppDownload.compressMode !== 'none' && (
-                        <span className="px-2 py-0.5 rounded-md bg-emerald-500/15 border border-emerald-500/30 text-[11px] text-emerald-300 font-bold">
-                          {inAppDownload.compressMode === 'zip' ? '✓ مضغوط ZIP قبل التحميل' : '✓ مضغوط الحجم قبل التحميل'}
-                        </span>
-                      )}
+                      <span aria-hidden="true">·</span>
+                      <span>{inAppDownload.formatLabel}</span>
                     </div>
                     <p className="text-sm font-bold text-white truncate mt-0.5" dir="ltr">
                       {inAppDownload.fileName}
@@ -1688,7 +2244,7 @@ export default function App() {
                       <button
                         type="button"
                         onClick={togglePauseInAppDownload}
-                        className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 transition cursor-pointer ${
+                        className={`min-h-[38px] px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 transition cursor-pointer ${
                           inAppDownload.status === 'paused'
                             ? 'bg-emerald-600 hover:bg-emerald-500 text-white'
                             : 'bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200'
@@ -1710,7 +2266,7 @@ export default function App() {
                       <button
                         type="button"
                         onClick={cancelInAppDownload}
-                        className="px-3 py-1.5 rounded-xl bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-rose-200 text-xs font-bold flex items-center gap-1.5 transition cursor-pointer"
+                        className="min-h-[38px] px-3 py-1.5 rounded-xl bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-rose-200 text-xs font-bold flex items-center gap-1.5 transition cursor-pointer"
                       >
                         <Ban className="w-3.5 h-3.5" />
                         <span>إلغاء</span>
@@ -1722,7 +2278,7 @@ export default function App() {
                     <button
                       type="button"
                       onClick={() => triggerBrowserBlobSave(inAppDownload.blobUrl!, inAppDownload.fileName)}
-                      className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center gap-1.5 transition cursor-pointer"
+                      className="min-h-[38px] px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center gap-1.5 transition cursor-pointer"
                     >
                       <Download className="w-3.5 h-3.5" />
                       <span>حفظ الملف للجهاز</span>
@@ -1735,7 +2291,7 @@ export default function App() {
                     <button
                       type="button"
                       onClick={() => setInAppDownload(null)}
-                      className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white transition cursor-pointer"
+                      className="min-h-[38px] min-w-[38px] p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white flex items-center justify-center transition cursor-pointer"
                       title="إغلاق شريط التحميل"
                     >
                       <X className="w-4 h-4" />
@@ -1754,13 +2310,13 @@ export default function App() {
                         ? 'bg-amber-500'
                         : inAppDownload.status === 'cancelled' || inAppDownload.status === 'failed'
                           ? 'bg-rose-500'
-                          : 'bg-gradient-to-r from-sky-500 to-indigo-500'
+                          : 'bg-sky-500'
                   }`}
                   style={{ width: `${Math.max(inAppDownload.status === 'downloading' ? 3 : 0, inAppDownload.percent)}%` }}
                 />
               </div>
 
-              {/* Live Metrics & Compression Verification Footer */}
+              {/* Live Metrics Footer */}
               <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-300 tabular-nums">
                 <div className="flex items-center gap-2 flex-wrap">
                   <span className="font-bold text-white" dir="ltr">
@@ -1781,23 +2337,13 @@ export default function App() {
                   )}
                 </div>
 
-                {/* Proof of Compression in Download Bar */}
                 {inAppDownload.originalBytes > 0 &&
                   inAppDownload.totalBytes > 0 &&
                   inAppDownload.originalBytes > inAppDownload.totalBytes && (
                     <div className="text-[11px] text-emerald-300 font-semibold flex items-center gap-1.5">
                       <span>الأصلي: {formatBytes(inAppDownload.originalBytes)}</span>
                       <span>←</span>
-                      <span>بعد الضغط: {formatBytes(inAppDownload.totalBytes)}</span>
-                      <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold">
-                        توفير{' '}
-                        {Math.round(
-                          ((inAppDownload.originalBytes - inAppDownload.totalBytes) /
-                            inAppDownload.originalBytes) *
-                            100
-                        )}
-                        %
-                      </span>
+                      <span>الحجم الفعلي: {formatBytes(inAppDownload.totalBytes)}</span>
                     </div>
                   )}
               </div>
@@ -1809,197 +2355,10 @@ export default function App() {
               )}
             </div>
           )}
-
-          {/* Pre-Download Inspection: Compression Proof & Available Formats/Sizes List */}
-          {resolvedMediaInfo && (
-            <div className="mt-4 p-4 rounded-2xl bg-[#11192E] border border-indigo-500/35 space-y-4">
-              {/* Header: Title, Platform & Close Button */}
-              <div className="flex items-start justify-between gap-3 border-b border-slate-800/90 pb-3">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2 flex-wrap mb-1">
-                    <span className="px-2 py-0.5 rounded-md bg-indigo-500/20 border border-indigo-500/40 text-indigo-300 text-[11px] font-bold">
-                      {resolvedMediaInfo.platformName}
-                    </span>
-                    {resolvedMediaInfo.durationSec > 0 && (
-                      <span className="px-2 py-0.5 rounded-md bg-slate-800 text-slate-300 text-[11px] font-medium" dir="ltr">
-                        {Math.floor(resolvedMediaInfo.durationSec / 60)}:
-                        {String(resolvedMediaInfo.durationSec % 60).padStart(2, '0')} دقيقة
-                      </span>
-                    )}
-                    <span className="text-xs text-emerald-400 font-semibold">
-                      ✓ تم فحص الملف والضغط قبل التحميل
-                    </span>
-                  </div>
-                  <h3 className="text-sm sm:text-base font-bold text-white break-words">
-                    {resolvedMediaInfo.title}
-                  </h3>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setResolvedMediaInfo(null)}
-                  className="p-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white transition cursor-pointer shrink-0"
-                  title="إغلاق قائمة الصيغ"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-
-              {/* How do I know compression happened BEFORE downloading? -> Proof Comparison Box */}
-              <div className="p-3 rounded-xl bg-slate-950/80 border border-emerald-500/30 space-y-2">
-                <div className="flex items-center justify-between gap-2 flex-wrap">
-                  <span className="text-xs font-bold text-emerald-300 flex items-center gap-1.5">
-                    <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                    <span>إثبات الضغط وفحص الحجم قبل بدء التحميل:</span>
-                  </span>
-                  <span className="px-2 py-0.5 rounded-md bg-emerald-500/15 text-emerald-300 text-[11px] font-bold">
-                    {resolvedMediaInfo.compressMode === 'zip'
-                      ? 'وضع الضغط: أرشيف ZIP (Deflate)'
-                      : resolvedMediaInfo.compressMode === 'media'
-                        ? 'وضع الضغط: ضغط دقة ومعدل بت الفيديو/الصوت'
-                        : 'مقارنة الأحجام حسب الصيغة والجودة'}
-                  </span>
-                </div>
-
-                <div className="grid grid-cols-3 gap-2 pt-1 text-center">
-                  <div className="p-2 rounded-lg bg-slate-900/90 border border-slate-800">
-                    <p className="text-[11px] text-slate-400">الحجم الأصلي (الكامل)</p>
-                    <p className="text-xs sm:text-sm font-bold text-slate-200 mt-0.5 tabular-nums" dir="ltr">
-                      {resolvedMediaInfo.originalSizeBytes > 0
-                        ? formatBytes(resolvedMediaInfo.originalSizeBytes)
-                        : 'متغير حسب الصيغة'}
-                    </p>
-                  </div>
-                  <div className="p-2 rounded-lg bg-emerald-950/30 border border-emerald-500/30">
-                    <p className="text-[11px] text-emerald-300">الحجم بعد الضغط</p>
-                    <p className="text-xs sm:text-sm font-bold text-emerald-400 mt-0.5 tabular-nums" dir="ltr">
-                      {resolvedMediaInfo.compressedSizeBytes > 0
-                        ? formatBytes(resolvedMediaInfo.compressedSizeBytes)
-                        : 'اختر صيغة مضغوطة'}
-                    </p>
-                  </div>
-                  <div className="p-2 rounded-lg bg-indigo-950/30 border border-indigo-500/30">
-                    <p className="text-[11px] text-indigo-300">مقدار التوفير المسبق</p>
-                    <p className="text-xs sm:text-sm font-bold text-indigo-300 mt-0.5 tabular-nums">
-                      {resolvedMediaInfo.savedBytes > 0
-                        ? `${formatBytes(resolvedMediaInfo.savedBytes)} (${resolvedMediaInfo.savedPercent}%)`
-                        : 'متاح بالصيغ بالأسفل'}
-                    </p>
-                  </div>
-                </div>
-              </div>
-
-              {/* Available Formats & Sizes Table with Direct + Compressed ZIP Download Buttons */}
-              <div className="space-y-2">
-                <p className="text-xs font-bold text-slate-300">
-                  اختر الصيغة والحجم المناسب لبدء التحميل داخل التطبيق (مع شريط التقدم والإيقاف المؤقت):
-                </p>
-
-                <div className="space-y-2 max-h-80 overflow-y-auto pr-0.5">
-                  {resolvedMediaInfo.availableFormats.map((fmt) => {
-                    const zipBytes = fmt.sizeBytes > 0 ? Math.round(fmt.sizeBytes * 0.94) : 0;
-                    return (
-                      <div
-                        key={fmt.id}
-                        className={`p-3 rounded-xl border transition flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
-                          fmt.isSelected
-                            ? 'bg-indigo-950/40 border-indigo-500/50'
-                            : 'bg-slate-950/70 border-slate-800/90 hover:border-slate-700'
-                        }`}
-                      >
-                        <div className="flex items-center gap-2.5 min-w-0">
-                          <div
-                            className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${
-                              fmt.format === 'audio'
-                                ? 'bg-purple-500/15 text-purple-400 border border-purple-500/30'
-                                : 'bg-sky-500/15 text-sky-400 border border-sky-500/30'
-                            }`}
-                          >
-                            {fmt.format === 'audio' ? (
-                              <Music className="w-4 h-4" />
-                            ) : (
-                              <Film className="w-4 h-4" />
-                            )}
-                          </div>
-                          <div className="min-w-0">
-                            <div className="flex items-center gap-1.5 flex-wrap">
-                              <span className="text-xs sm:text-sm font-bold text-white">{fmt.label}</span>
-                              {fmt.isSelected && (
-                                <span className="px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 text-[10px] font-bold">
-                                  اختيارك الحالي
-                                </span>
-                              )}
-                              {fmt.savedPercent > 0 && (
-                                <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 text-[10px] font-bold">
-                                  مضغوط (-{fmt.savedPercent}% حجم أقل)
-                                </span>
-                              )}
-                            </div>
-                            <div className="flex items-center gap-2 text-[11px] text-slate-400 mt-0.5 tabular-nums flex-wrap">
-                              <span>
-                                الحجم:{' '}
-                                <strong className="text-slate-200" dir="ltr">
-                                  {fmt.sizeBytes > 0 ? formatBytes(fmt.sizeBytes) : 'تلقائي'}
-                                </strong>
-                              </span>
-                              <span>·</span>
-                              <span className="text-slate-400">{fmt.badge}</span>
-                            </div>
-                          </div>
-                        </div>
-
-                        {/* Action Buttons for this Format */}
-                        <div className="flex items-center gap-2 shrink-0">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              startInAppStreamDownload({
-                                downloadUrl: fmt.downloadUrl,
-                                fileName: fmt.fileName,
-                                formatLabel: fmt.label,
-                                compressMode: fmt.savedPercent > 0 ? 'media' : 'none',
-                                expectedBytes: fmt.sizeBytes,
-                                originalBytes: resolvedMediaInfo.originalSizeBytes || fmt.sizeBytes,
-                              })
-                            }
-                            className="flex-1 sm:flex-none px-3 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer shadow-sm"
-                          >
-                            <Download className="w-3.5 h-3.5" />
-                            <span>
-                              تحميل {fmt.ext.toUpperCase()}
-                              {fmt.sizeBytes > 0 ? ` (${formatBytes(fmt.sizeBytes)})` : ''}
-                            </span>
-                          </button>
-
-                          <button
-                            type="button"
-                            onClick={() =>
-                              startInAppStreamDownload({
-                                downloadUrl: fmt.zipDownloadUrl,
-                                fileName: fmt.zipFileName,
-                                formatLabel: `${fmt.label} (ZIP)`,
-                                compressMode: 'zip',
-                                expectedBytes: zipBytes,
-                                originalBytes: resolvedMediaInfo.originalSizeBytes || fmt.sizeBytes,
-                              })
-                            }
-                            className="px-3 py-2 rounded-xl bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/40 text-emerald-300 text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer"
-                            title="ضغط الملف بصيغة ZIP قبل التحميل لتقليل الحجم"
-                          >
-                            <FileArchive className="w-3.5 h-3.5" />
-                            <span>ZIP مضغوط</span>
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            </div>
-          )}
         </section>
 
         {/* Core Card 2: Live Personal Transfer Queue & History */}
-        <section className="w-full bg-[#0D1322] border border-slate-800/90 rounded-2xl p-4 sm:p-6 space-y-4">
+        <section className="w-full bg-[#0F1626] border border-slate-800/90 rounded-2xl p-4 sm:p-6 space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800/80 pb-3.5">
             <div className="flex items-center gap-2">
               <Activity className="w-4 h-4 text-sky-400" />
@@ -2010,7 +2369,7 @@ export default function App() {
               {(serverStatus?.stats.activeJobs || 0) + (serverStatus?.stats.waitingAuthJobs || 0) > 0 && (
                 <button
                   onClick={() => handleCancelAllJobs('personal')}
-                  className="px-3 py-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-rose-300 text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
+                  className="min-h-[38px] px-3 py-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-rose-300 text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
                 >
                   <Ban className="w-3.5 h-3.5" />
                   <span>إلغاء الجارية</span>
@@ -2021,7 +2380,7 @@ export default function App() {
                 <button
                   onClick={handleClearFailedJobs}
                   disabled={clearingFailed}
-                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
+                  className="min-h-[38px] px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
                 >
                   <Trash2 className="w-3.5 h-3.5 text-rose-400" />
                   <span>مسح الفاشلة ({serverStatus?.stats.failedJobs})</span>
@@ -2223,14 +2582,14 @@ export default function App() {
         >
           <div
             className={`bg-[#0D1322] border border-slate-800 rounded-2xl w-full ${
-              activeModal === 'menu' ? 'max-w-md' : 'max-w-2xl'
+              activeModal === 'menu' || activeModal === 'pwa_install' ? 'max-w-md' : 'max-w-2xl'
             } max-h-[88vh] flex flex-col shadow-2xl overflow-hidden`}
             onClick={(e) => e.stopPropagation()}
           >
             {/* Modal Header with Back-to-Menu & Close */}
             <div className="px-4 sm:px-5 py-3.5 border-b border-slate-800 flex items-center justify-between gap-2 shrink-0">
               <div className="flex items-center gap-2 min-w-0">
-                {activeModal !== 'menu' && activeModal !== 'url_options' && (
+                {activeModal !== 'menu' && (
                   <button
                     type="button"
                     onClick={() => setActiveModal('menu')}
@@ -2242,6 +2601,7 @@ export default function App() {
                 )}
                 <h2 className="text-sm sm:text-base font-bold text-white truncate">
                   {activeModal === 'menu' && 'قائمة الخيارات والبوابات المنبثقة'}
+                  {activeModal === 'pwa_install' && 'تثبيت التطبيق على شاشة الهاتف'}
                   {activeModal === 'drive_files' && 'ملفاتي ومجلداتي في Google Drive'}
                   {activeModal === 'large_upload' && 'رفع الملفات الضخمة مباشرة'}
                   {activeModal === 'settings' && 'حسابي الشخصي وإعدادات الربط'}
@@ -2261,12 +2621,34 @@ export default function App() {
 
             {/* Modal Body */}
             <div className="p-4 sm:p-5 overflow-y-auto space-y-4 flex-1">
-              {/* POPUP 0: THE TOP MENU LAUNCHER (كل خيار تنبثق منه صفحته) */}
+              {/* POPUP 0: THE TOP MENU LAUNCHER */}
               {activeModal === 'menu' && (
                 <div className="space-y-2.5">
                   <p className="text-xs text-slate-400 mb-3">
                     اختر أي قسم لفتح صفحته المنبثقة الخاصة:
                   </p>
+
+                  {/* Option 0: Install App on Phone Home Screen */}
+                  {!isInstalled && (
+                    <button
+                      type="button"
+                      onClick={handleInstallButtonClick}
+                      className="w-full p-3.5 rounded-xl bg-emerald-950/40 hover:bg-emerald-950/60 border border-emerald-500/40 flex items-center justify-between gap-3 text-right transition cursor-pointer"
+                    >
+                      <div className="flex items-center gap-3 min-w-0">
+                        <div className="w-10 h-10 rounded-xl bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-400 shrink-0">
+                          <Smartphone className="w-5 h-5" />
+                        </div>
+                        <div className="min-w-0">
+                          <p className="text-sm font-bold text-white">تثبيت التطبيق على شاشة الهاتف</p>
+                          <p className="text-xs text-emerald-300/90 truncate mt-0.5">
+                            إضافة أيقونة TeleDrive على الشاشة الرئيسية للفتح السريع كتطبيق مستقل
+                          </p>
+                        </div>
+                      </div>
+                      <ChevronLeft className="w-4 h-4 text-emerald-400 shrink-0" />
+                    </button>
+                  )}
 
                   {/* Option 1: Personal Account & Link Settings */}
                   <button
@@ -2355,109 +2737,87 @@ export default function App() {
                 </div>
               )}
 
-              {/* MODAL 1: URL EXTRACTION OPTIONS */}
-              {activeModal === 'url_options' && (
+              {/* MODAL: PWA INSTALL ON PHONE HOME SCREEN */}
+              {activeModal === 'pwa_install' && (
                 <div className="space-y-4">
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-300 mb-2">
-                      صيغة الملف المسحوب
-                    </label>
-                    <div className="grid grid-cols-2 gap-2.5">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setExternalMediaFormat('video');
-                          setExternalQuality('720');
-                        }}
-                        className={`py-2.5 px-3 rounded-xl text-xs font-semibold border transition cursor-pointer ${
-                          externalMediaFormat === 'video'
-                            ? 'bg-sky-500/20 border-sky-500/40 text-sky-300'
-                            : 'bg-slate-900 border-slate-800 text-slate-400'
-                        }`}
-                      >
-                        فيديو (MP4)
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setExternalMediaFormat('audio');
-                          setExternalQuality('320');
-                        }}
-                        className={`py-2.5 px-3 rounded-xl text-xs font-semibold border transition cursor-pointer ${
-                          externalMediaFormat === 'audio'
-                            ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
-                            : 'bg-slate-900 border-slate-800 text-slate-400'
-                        }`}
-                      >
-                        صوت فقط (MP3)
-                      </button>
+                  <div className="p-4 rounded-xl bg-slate-900/80 border border-slate-800 flex items-center gap-3.5">
+                    <img
+                      src="/pwa-192x192.png"
+                      alt="TeleDrive App Icon"
+                      referrerPolicy="no-referrer"
+                      className="w-14 h-14 rounded-2xl border border-slate-700 shrink-0"
+                    />
+                    <div className="space-y-1">
+                      <h3 className="text-sm font-bold text-white">تطبيق TeleDrive Cloud</h3>
+                      <p className="text-xs text-slate-400">
+                        يعمل كتطبيق مستقل بملء الشاشة على هاتفك لسهولة لصق الروابط والتحميل المباشر.
+                      </p>
                     </div>
                   </div>
 
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-300 mb-2">
-                      {externalMediaFormat === 'audio' ? 'جودة الصوت (Bitrate)' : 'دقة الفيديو'}
-                    </label>
-                    {externalMediaFormat === 'video' ? (
-                      <select
-                        value={externalQuality}
-                        onChange={(e) => setExternalQuality(e.target.value)}
-                        className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white"
-                      >
-                        <option value="1080">1080p Full HD (عالية جداً)</option>
-                        <option value="720">720p HD (موصى بها وسريعة)</option>
-                        <option value="480">480p (متوسطة لتوفير الحجم)</option>
-                        <option value="360">360p (خفيفة وسريعة)</option>
-                        <option value="240">240p (أقل استهلاك للبيانات)</option>
-                      </select>
-                    ) : (
-                      <select
-                        value={externalQuality}
-                        onChange={(e) => setExternalQuality(e.target.value)}
-                        className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white"
-                      >
-                        <option value="320">320 kbps (نقاء فائق)</option>
-                        <option value="192">192 kbps (جودة ممتازة)</option>
-                        <option value="128">128 kbps (حجم خفيف)</option>
-                      </select>
-                    )}
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-300 mb-2">
-                      ضغط الملف قبل النقل أو التحميل
-                    </label>
-                    <select
-                      value={externalCompressMode}
-                      onChange={(e) => setExternalCompressMode(e.target.value as CompressMode)}
-                      className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white"
+                  {isInstallable && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const ok = await triggerPwaInstall();
+                        if (ok) setActiveModal(null);
+                      }}
+                      className="w-full min-h-[46px] py-2.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center justify-center gap-2 transition cursor-pointer shadow-md"
                     >
-                      <option value="none">بدون ضغط (الحجم الأصلي الكامل)</option>
-                      <option value="zip">ضغط أرشيف ZIP (.zip)</option>
-                      <option value="media">تقليص حجم الفيديو/الصوت (FFmpeg)</option>
-                    </select>
-                  </div>
+                      <Download className="w-4 h-4" />
+                      <span>تثبيت التطبيق مباشرة الآن</span>
+                    </button>
+                  )}
 
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-300 mb-2">
-                      اسم مخصص للملف (اختياري)
-                    </label>
-                    <input
-                      type="text"
-                      value={externalCustomName}
-                      onChange={(e) => setExternalCustomName(e.target.value)}
-                      placeholder="اتركه فارغاً لاستخدام الاسم الأصلي"
-                      className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white placeholder-slate-500"
-                    />
-                  </div>
+                  {!isIOS ? (
+                    <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2.5 text-xs">
+                      <p className="font-bold text-sky-300">
+                        طريقة التثبيت على هواتف أندرويد (متصفح Chrome):
+                      </p>
+                      <ol className="list-decimal list-inside space-y-2 text-slate-300 leading-relaxed">
+                        <li>
+                          اضغط على زر القائمة <strong className="text-white">(⋮)</strong> في أعلى يسار أو يمين متصفح Chrome.
+                        </li>
+                        <li>
+                          اختر <strong className="text-emerald-300">"تثبيت التطبيق" (Install app)</strong> أو{' '}
+                          <strong className="text-emerald-300">"الإضافة إلى الشاشة الرئيسية"</strong>.
+                        </li>
+                        <li>
+                          اضغط <strong className="text-white">تثبيت</strong> لتظهر أيقونة التطبيق مباشرة بين تطبيقات هاتفك.
+                        </li>
+                      </ol>
+                    </div>
+                  ) : (
+                    <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2.5 text-xs">
+                      <p className="font-bold text-sky-300">
+                        طريقة التثبيت على آيفون وآيباد (متصفح Safari):
+                      </p>
+                      <ol className="list-decimal list-inside space-y-2 text-slate-300 leading-relaxed">
+                        <li className="flex items-center gap-1.5 flex-wrap">
+                          <span>1. اضغط على زر المشاركة</span>
+                          <Share2 className="w-3.5 h-3.5 text-sky-400 inline" />
+                          <strong className="text-white">(Share)</strong>
+                          <span>في الشريط السفلي لمتصفح Safari.</span>
+                        </li>
+                        <li className="flex items-center gap-1.5 flex-wrap">
+                          <span>2. مرر للأسفل واختر</span>
+                          <PlusSquare className="w-3.5 h-3.5 text-emerald-400 inline" />
+                          <strong className="text-emerald-300">"إضافة إلى الشاشة الرئيسية" (Add to Home Screen)</strong>.
+                        </li>
+                        <li>
+                          3. اضغط <strong className="text-white">إضافة (Add)</strong> في أعلى الزاوية ليظهر التطبيق على شاشتك.
+                        </li>
+                      </ol>
+                    </div>
+                  )}
 
-                  <div className="pt-2 flex justify-end">
+                  <div className="pt-1 flex justify-end">
                     <button
                       type="button"
                       onClick={() => setActiveModal(null)}
-                      className="px-5 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold cursor-pointer"
+                      className="min-h-[40px] px-5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold cursor-pointer"
                     >
-                      حفظ وإغلاق
+                      حسناً، فهمت
                     </button>
                   </div>
                 </div>
