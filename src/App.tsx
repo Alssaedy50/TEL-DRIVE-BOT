@@ -942,7 +942,8 @@ export default function App() {
       const contentLengthHeader = Number(res.headers.get('content-length') || 0);
       const xOriginalSizeHeader = Number(res.headers.get('x-original-size') || 0);
       const totalBytes = contentLengthHeader > 0 ? contentLengthHeader : initialTotal;
-      const originalBytes = xOriginalSizeHeader > 0 ? xOriginalSizeHeader : initialOriginal || totalBytes;
+      const originalBytes =
+        initialOriginal > 0 ? initialOriginal : xOriginalSizeHeader > 0 ? xOriginalSizeHeader : totalBytes;
 
       setInAppDownload((prev) =>
         prev
@@ -999,7 +1000,7 @@ export default function App() {
 
           const now = Date.now();
           const elapsedMs = now - lastTickTime;
-          if (elapsedMs >= 250) {
+          if (elapsedMs >= 200) {
             currentSpeedBps = Math.round((bytesSinceLastTick * 1000) / elapsedMs);
             lastTickTime = now;
             bytesSinceLastTick = 0;
@@ -1055,7 +1056,7 @@ export default function App() {
       setBannerSuccess(`اكتمل تحميل "${opts.fileName}" (${formatBytes(blob.size)}) بنجاح!`);
       setTimeout(() => setBannerSuccess(null), 5000);
 
-      // Register completed device download in transfer history
+      // Register completed device download in transfer history with totalBytes
       try {
         await fetch('/api/transfers/register-web', {
           method: 'POST',
@@ -1063,10 +1064,13 @@ export default function App() {
           body: JSON.stringify({
             fileName: opts.fileName,
             mimeType: finalMime,
+            totalBytes: blob.size,
             sizeBytes: blob.size,
             direction: 'to_device',
             sourceType: 'direct_url',
             compressMode: opts.compressMode,
+            mediaFormat: opts.fileName.endsWith('.mp3') ? 'audio' : 'video',
+            quality: externalQuality,
             userEmail: personalEmail || undefined,
             chatId: personalChatId || undefined,
           }),
@@ -1116,12 +1120,6 @@ export default function App() {
       setBannerError(null);
       lastInspectedUrlRef.current = clean;
 
-      const rawCustom = externalCustomName.trim();
-      const safeCustomName =
-        rawCustom && !/^https?:\/\//i.test(rawCustom) && !/youtu\.?be|tiktok\.com|t\.me|drive\.google/i.test(rawCustom)
-          ? rawCustom
-          : undefined;
-
       try {
         const headers: Record<string, string> = { 'Content-Type': 'application/json' };
         if (accessToken) {
@@ -1132,10 +1130,9 @@ export default function App() {
           headers,
           body: JSON.stringify({
             url: clean,
-            customFileName: safeCustomName,
-            mediaFormat: fmtOverride || externalMediaFormat,
-            quality: qOverride || externalQuality,
-            compressMode: compOverride || externalCompressMode,
+            mediaFormat: fmtOverride || 'video',
+            quality: qOverride || '720',
+            compressMode: compOverride || 'none',
             userEmail: personalEmail || undefined,
             targetChatId: personalChatId || undefined,
           }),
@@ -1147,21 +1144,14 @@ export default function App() {
         setResolvedMediaInfo(data);
         return data;
       } catch (err: any) {
+        lastInspectedUrlRef.current = '';
         setBannerError(err?.message || 'حدث خطأ أثناء فحص الرابط واستخراج الصيغ.');
         return null;
       } finally {
         setInspectingUrl(false);
       }
     },
-    [
-      accessToken,
-      externalCustomName,
-      externalMediaFormat,
-      externalQuality,
-      externalCompressMode,
-      personalEmail,
-      personalChatId,
-    ]
+    [accessToken, personalEmail, personalChatId]
   );
 
   // Automatically inspect URL and display formats & sizes as soon as a valid link is pasted or typed
@@ -1174,14 +1164,14 @@ export default function App() {
       }
       return;
     }
-    if (trimmed === lastInspectedUrlRef.current && resolvedMediaInfo) {
+    if (trimmed === lastInspectedUrlRef.current) {
       return;
     }
     const timer = setTimeout(() => {
       inspectUrlFormats(trimmed);
-    }, 350);
+    }, 300);
     return () => clearTimeout(timer);
-  }, [externalUrlInput, inspectUrlFormats, resolvedMediaInfo]);
+  }, [externalUrlInput, inspectUrlFormats]);
 
   const handlePasteFromClipboard = async () => {
     setBannerError(null);
@@ -1198,6 +1188,80 @@ export default function App() {
       setBannerError('يرجى اللصق يدوياً داخل حقل الرابط أو السماح بصلاحية الحافظة.');
     }
   };
+
+  const getEffectiveFormatBytes = useCallback(
+    (baseBytes: number, mode: CompressMode = externalCompressMode) => {
+      if (!baseBytes || baseBytes <= 0) return 0;
+      if (mode === 'zip') return Math.max(64 * 1024, Math.round(baseBytes * 0.92));
+      if (mode === 'media') return Math.max(64 * 1024, Math.round(baseBytes * 0.65));
+      return baseBytes;
+    },
+    [externalCompressMode]
+  );
+
+  const buildFormatDownloadParams = useCallback(
+    (
+      fmt: AvailableMediaFormat,
+      mode: CompressMode,
+      rawCustomName: string,
+      baselineOriginalBytes: number
+    ) => {
+      const effectiveBytes = getEffectiveFormatBytes(fmt.sizeBytes, mode);
+      const isZip = mode === 'zip';
+      const effectiveCompress: CompressMode = isZip
+        ? 'zip'
+        : mode === 'media' || fmt.savedPercent > 0
+          ? 'media'
+          : 'none';
+
+      const cleanCustom =
+        rawCustomName.trim() &&
+        !/^https?:\/\//i.test(rawCustomName.trim()) &&
+        !/youtu\.?be|tiktok\.com|t\.me|drive\.google/i.test(rawCustomName.trim())
+          ? rawCustomName.trim().replace(/\.[^/.]+$/, '')
+          : '';
+
+      const targetFileName = cleanCustom
+        ? `${cleanCustom}.${isZip ? `${fmt.ext}.zip` : fmt.ext}`
+        : isZip
+          ? fmt.zipFileName
+          : fmt.fileName;
+
+      const baseUrl = isZip ? fmt.zipDownloadUrl : fmt.downloadUrl;
+      let finalUrl = baseUrl;
+      try {
+        const parsed = new URL(baseUrl, window.location.origin);
+        parsed.pathname = `/api/direct-download/${encodeURIComponent(targetFileName)}`;
+        parsed.searchParams.set('name', targetFileName);
+        parsed.searchParams.set('compress', effectiveCompress);
+        if (effectiveBytes > 0) {
+          parsed.searchParams.set('targetBytes', String(effectiveBytes));
+        }
+        if (baselineOriginalBytes > 0) {
+          parsed.searchParams.set('origBytes', String(baselineOriginalBytes));
+        }
+        finalUrl = `${parsed.pathname}${parsed.search}`;
+      } catch {
+        // Fallback to baseUrl if URL parsing fails
+      }
+
+      const formatLabel = isZip
+        ? `${fmt.label} (ZIP)`
+        : mode === 'media'
+          ? `${fmt.label} (مقلّص)`
+          : fmt.label;
+
+      return {
+        downloadUrl: finalUrl,
+        fileName: targetFileName,
+        formatLabel,
+        compressMode: effectiveCompress,
+        expectedBytes: effectiveBytes,
+        originalBytes: baselineOriginalBytes || fmt.sizeBytes,
+      };
+    },
+    [getEffectiveFormatBytes]
+  );
 
   const handleUrlUploadSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1219,7 +1283,10 @@ export default function App() {
         if (!info || lastInspectedUrlRef.current !== externalUrlInput.trim()) {
           info = await inspectUrlFormats(externalUrlInput.trim());
         }
-        if (!info) return;
+        if (!info) {
+          setSubmittingUrl(false);
+          return;
+        }
 
         // Find matching format from availableFormats based on user's selected format & quality
         const matchedFmt =
@@ -1229,36 +1296,33 @@ export default function App() {
           info.availableFormats.find((f) => f.format === externalMediaFormat) ||
           info.availableFormats[0];
 
-        if (matchedFmt) {
-          const isZip = externalCompressMode === 'zip';
-          const customBase = safeCustomName ? safeCustomName.replace(/\.[^/.]+$/, '') : '';
-          const targetFileName = customBase
-            ? `${customBase}.${isZip ? `${matchedFmt.ext}.zip` : matchedFmt.ext}`
-            : isZip
-              ? matchedFmt.zipFileName
-              : matchedFmt.fileName;
+        // Release submit button spinner as soon as in-app download card takes over
+        setSubmittingUrl(false);
 
-          await startInAppStreamDownload({
-            downloadUrl: isZip ? matchedFmt.zipDownloadUrl : matchedFmt.downloadUrl,
-            fileName: targetFileName,
-            formatLabel: isZip ? `${matchedFmt.label} (ZIP)` : matchedFmt.label,
-            compressMode: isZip ? 'zip' : matchedFmt.savedPercent > 0 ? 'media' : externalCompressMode,
-            expectedBytes: isZip ? Math.round(matchedFmt.sizeBytes * 0.94) : matchedFmt.sizeBytes,
-            originalBytes: info.originalSizeBytes || matchedFmt.sizeBytes,
-          });
+        if (matchedFmt) {
+          const dlParams = buildFormatDownloadParams(
+            matchedFmt,
+            externalCompressMode,
+            externalCustomName,
+            info.originalSizeBytes || matchedFmt.sizeBytes
+          );
+          void startInAppStreamDownload(dlParams);
         } else {
-          await startInAppStreamDownload({
+          const fallbackBytes = getEffectiveFormatBytes(
+            info.compressedSizeBytes || info.sizeBytes,
+            externalCompressMode
+          );
+          void startInAppStreamDownload({
             downloadUrl: info.proxyDownloadUrl,
             fileName: info.fileName,
             formatLabel: externalMediaFormat === 'audio' ? `MP3 • ${externalQuality}kbps` : `MP4 • ${externalQuality}p`,
             compressMode: externalCompressMode,
-            expectedBytes: info.compressedSizeBytes || info.sizeBytes,
+            expectedBytes: fallbackBytes,
             originalBytes: info.originalSizeBytes || info.sizeBytes,
           });
         }
       } catch (err: any) {
         setBannerError(err?.message || 'حدث خطأ أثناء بدء التحميل المباشر.');
-      } finally {
         setSubmittingUrl(false);
       }
       return;
@@ -1269,6 +1333,14 @@ export default function App() {
       if (accessToken) {
         headers.Authorization = `Bearer ${accessToken}`;
       }
+      const matchedFmt =
+        resolvedMediaInfo?.availableFormats?.find(
+          (f) => f.format === externalMediaFormat && f.quality === externalQuality
+        ) || resolvedMediaInfo?.availableFormats?.find((f) => f.format === externalMediaFormat);
+      const targetBytesForJob = matchedFmt
+        ? getEffectiveFormatBytes(matchedFmt.sizeBytes, externalCompressMode)
+        : undefined;
+
       const res = await fetch('/api/transfers/url', {
         method: 'POST',
         headers,
@@ -1279,6 +1351,8 @@ export default function App() {
           mediaFormat: externalMediaFormat,
           quality: externalQuality,
           compressMode: externalCompressMode,
+          targetBytes: targetBytesForJob,
+          durationSec: resolvedMediaInfo?.durationSec || undefined,
           userEmail: personalEmail || undefined,
           targetChatId: personalChatId || undefined,
         }),
@@ -1290,8 +1364,8 @@ export default function App() {
       lastInspectedUrlRef.current = '';
       setBannerSuccess(
         externalDestination === 'telegram'
-          ? 'تم بدء سحب الرابط بالصيغة والدقة المختارة وإرساله إلى محادثتك في تليجرام!'
-          : 'تمت إضافة الرابط بالصيغة والدقة المختارة لطابور الرفع إلى Google Drive!'
+          ? 'تم بدء سحب الرابط بالصيغة والحجم المختارين وإرساله إلى محادثتك في تليجرام!'
+          : 'تمت إضافة الرابط بالصيغة والحجم المختارين لطابور الرفع إلى Google Drive!'
       );
       setTimeout(() => setBannerSuccess(null), 4000);
       fetchStatus();
@@ -1548,10 +1622,11 @@ export default function App() {
   ) || resolvedMediaInfo?.availableFormats?.find((f) => f.format === externalMediaFormat);
 
   const selectedEffectiveBytes = selectedResolvedFormatObj
-    ? externalCompressMode === 'zip'
-      ? Math.round(selectedResolvedFormatObj.sizeBytes * 0.94)
-      : selectedResolvedFormatObj.sizeBytes
-    : resolvedMediaInfo?.compressedSizeBytes || resolvedMediaInfo?.sizeBytes || 0;
+    ? getEffectiveFormatBytes(selectedResolvedFormatObj.sizeBytes, externalCompressMode)
+    : getEffectiveFormatBytes(
+        resolvedMediaInfo?.compressedSizeBytes || resolvedMediaInfo?.sizeBytes || 0,
+        externalCompressMode
+      );
 
   const selectedOriginalBytes =
     resolvedMediaInfo?.originalSizeBytes || selectedResolvedFormatObj?.sizeBytes || 0;
@@ -1903,8 +1978,8 @@ export default function App() {
 
               {/* Resolution & Exact Size Grid */}
               {resolvedMediaInfo && resolvedMediaInfo.availableFormats.length > 0 ? (
-                <div className="space-y-3">
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <div className="space-y-2.5">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                     {resolvedMediaInfo.availableFormats
                       .filter((fmt) =>
                         resolvedMediaInfo.isVideoPlatform ? fmt.format === externalMediaFormat : true
@@ -1913,10 +1988,13 @@ export default function App() {
                         const isChosen =
                           externalMediaFormat === fmt.format &&
                           (externalQuality === fmt.quality || fmt.quality === 'original');
-                        const displayBytes =
-                          externalCompressMode === 'zip' && fmt.sizeBytes > 0
-                            ? Math.round(fmt.sizeBytes * 0.94)
-                            : fmt.sizeBytes;
+                        const displayBytes = getEffectiveFormatBytes(fmt.sizeBytes, externalCompressMode);
+                        const baseOriginal = resolvedMediaInfo.originalSizeBytes || fmt.sizeBytes;
+                        const dynamicSavedPct =
+                          baseOriginal > 0 && displayBytes > 0 && displayBytes < baseOriginal
+                            ? Math.round(((baseOriginal - displayBytes) / baseOriginal) * 100)
+                            : fmt.savedPercent;
+                        const cleanBadge = fmt.badge.replace(/\s*\([^)]*توفير[^)]*\)/g, '').trim();
 
                         return (
                           <div
@@ -1927,14 +2005,14 @@ export default function App() {
                                 setExternalQuality(fmt.quality);
                               }
                             }}
-                            className={`p-3.5 rounded-xl border transition cursor-pointer flex items-center justify-between gap-3 ${
+                            className={`p-3 rounded-xl border transition cursor-pointer flex items-center justify-between gap-2.5 ${
                               isChosen
                                 ? 'bg-sky-500/15 border-sky-500 text-white shadow-sm'
                                 : 'bg-slate-900/70 border-slate-800/90 hover:border-slate-700 text-slate-200'
                             }`}
                           >
-                            <div className="min-w-0 flex-1 space-y-1">
-                              <div className="flex items-center gap-2 flex-wrap">
+                            <div className="min-w-0 flex-1 space-y-0.5">
+                              <div className="flex items-center gap-1.5 flex-wrap">
                                 <span className="text-xs sm:text-sm font-bold text-white">
                                   {fmt.label}
                                 </span>
@@ -1945,12 +2023,12 @@ export default function App() {
                                 )}
                               </div>
                               <div className="flex items-center gap-1.5 text-[11px] text-slate-400 tabular-nums flex-wrap">
-                                <span>{fmt.badge}</span>
-                                {fmt.savedPercent > 0 && (
+                                <span>{cleanBadge}</span>
+                                {dynamicSavedPct > 0 && (
                                   <>
                                     <span aria-hidden="true">·</span>
                                     <span className="text-emerald-400 font-semibold">
-                                      توفير {fmt.savedPercent}%
+                                      توفير {dynamicSavedPct}%
                                     </span>
                                   </>
                                 )}
@@ -1969,8 +2047,13 @@ export default function App() {
                                   {displayBytes > 0 ? formatBytes(displayBytes) : 'تلقائي'}
                                 </span>
                                 {externalCompressMode === 'zip' && (
-                                  <span className="block text-[10px] text-emerald-400 font-medium">
+                                  <span className="block text-[10px] text-indigo-300 font-medium">
                                     مضغوط ZIP
+                                  </span>
+                                )}
+                                {externalCompressMode === 'media' && (
+                                  <span className="block text-[10px] text-emerald-400 font-medium">
+                                    مقلّص الحجم
                                   </span>
                                 )}
                               </div>
@@ -1983,18 +2066,16 @@ export default function App() {
                                   if (fmt.quality !== 'original') {
                                     setExternalQuality(fmt.quality);
                                   }
-                                  const isZip = externalCompressMode === 'zip';
-                                  startInAppStreamDownload({
-                                    downloadUrl: isZip ? fmt.zipDownloadUrl : fmt.downloadUrl,
-                                    fileName: isZip ? fmt.zipFileName : fmt.fileName,
-                                    formatLabel: isZip ? `${fmt.label} (ZIP)` : fmt.label,
-                                    compressMode: isZip ? 'zip' : fmt.savedPercent > 0 ? 'media' : 'none',
-                                    expectedBytes: displayBytes,
-                                    originalBytes: resolvedMediaInfo.originalSizeBytes || fmt.sizeBytes,
-                                  });
+                                  const dlParams = buildFormatDownloadParams(
+                                    fmt,
+                                    externalCompressMode,
+                                    externalCustomName,
+                                    resolvedMediaInfo.originalSizeBytes || fmt.sizeBytes
+                                  );
+                                  void startInAppStreamDownload(dlParams);
                                 }}
                                 className="min-h-[38px] min-w-[38px] px-2.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold flex items-center justify-center gap-1 transition cursor-pointer shrink-0"
-                                title="تحميل مباشر بهذه الصيغة والحجم"
+                                title="تحميل مباشر بهذه الصيغة والحجم المحدد"
                               >
                                 <Download className="w-3.5 h-3.5" />
                               </button>
@@ -2219,7 +2300,9 @@ export default function App() {
                     <div className="flex items-center gap-2 flex-wrap text-xs text-slate-300">
                       <span className="font-bold text-sky-300">
                         {inAppDownload.status === 'downloading'
-                          ? 'جاري التحميل داخل التطبيق...'
+                          ? inAppDownload.bytesLoaded === 0
+                            ? 'جاري تجهيز وضغط الملف بالحجم المحدد...'
+                            : 'جاري التحميل داخل التطبيق...'
                           : inAppDownload.status === 'paused'
                             ? 'التحميل متوقف مؤقتاً'
                             : inAppDownload.status === 'completed'
