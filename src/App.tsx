@@ -145,11 +145,57 @@ interface ResolvedMediaInfo {
   effectiveQuality: string;
   platformName: string;
   isVideoPlatform: boolean;
+  zipEligible?: boolean;
+  zipSavedPercent?: number;
   durationSec: number;
   directStreamUrl: string;
   proxyDownloadUrl: string;
   preferDirectCdn: boolean;
   availableFormats: AvailableMediaFormat[];
+}
+
+function evaluateFileLosslessZipInfo(
+  fileName: string,
+  mimeType?: string
+): { zipEligible: boolean; zipSavedPercent: number } {
+  const lowerName = (fileName || '').toLowerCase();
+  const lowerMime = (mimeType || '').toLowerCase();
+  const isUncompressedMedia = /\.(wav|aiff|pcm|bmp|tiff|tga|raw|svg)$/i.test(lowerName);
+  if (
+    !isUncompressedMedia &&
+    (lowerMime.startsWith('video/') ||
+      lowerMime.startsWith('audio/') ||
+      /\.(mp4|mkv|webm|mov|avi|flv|m4v|3gp|mp3|m4a|aac|ogg|opus|flac|wma|zip|rar|7z|gz|tgz|bz2|xz|zst|apk|ipa|dmg|deb|rpm|jpg|jpeg|png|webp|gif|heic|avif)$/i.test(
+        lowerName
+      ))
+  ) {
+    return { zipEligible: false, zipSavedPercent: 2 };
+  }
+  if (
+    /\.(txt|csv|tsv|json|xml|yaml|yml|sql|log|md|html|htm|css|js|ts|jsx|tsx|py|java|c|cpp|h|cs|php|rb|go|rs|srt|vtt|ass|sub|svg)$/i.test(
+      lowerName
+    ) ||
+    lowerMime.startsWith('text/') ||
+    lowerMime.includes('json') ||
+    lowerMime.includes('xml') ||
+    lowerMime.includes('svg')
+  ) {
+    return { zipEligible: true, zipSavedPercent: 62 };
+  }
+  if (/\.(bmp|wav|aiff|pcm|tar|iso|psd|ai|eps|ttf|otf|exe|dll|so|bin|db|sqlite|sqlite3|mdb|dbf|vcf|ics)$/i.test(lowerName)) {
+    return { zipEligible: true, zipSavedPercent: 38 };
+  }
+  if (
+    /\.(pdf|doc|docx|xls|xlsx|ppt|pptx|rtf|odt|ods|odp|epub|mobi)$/i.test(lowerName) ||
+    lowerMime.includes('pdf') ||
+    lowerMime.includes('msword') ||
+    lowerMime.includes('officedocument') ||
+    lowerMime.includes('spreadsheet') ||
+    lowerMime.includes('presentation')
+  ) {
+    return { zipEligible: true, zipSavedPercent: 22 };
+  }
+  return { zipEligible: false, zipSavedPercent: 4 };
 }
 
 interface InAppDownloadState {
@@ -1259,6 +1305,9 @@ export default function App() {
           'تعذر استخراج معلومات الرابط والصيغ المتاحة.'
         );
         setResolvedMediaInfo(data);
+        if (!data.zipEligible || data.isVideoPlatform) {
+          setExternalCompressMode('none');
+        }
         return data;
       } catch (err: any) {
         lastInspectedUrlRef.current = '';
@@ -1333,9 +1382,13 @@ export default function App() {
       rawCustomName: string,
       baselineOriginalBytes: number
     ) => {
-      const effectiveBytes = getEffectiveFormatBytes(fmt, mode);
-      const isZip = mode === 'zip';
-      const effectiveCompress: CompressMode = mode;
+      const canUseLosslessZip = Boolean(
+        resolvedMediaInfo?.zipEligible && (resolvedMediaInfo?.zipSavedPercent || 0) >= 10
+      );
+      const effectiveCompress: CompressMode =
+        mode === 'zip' && canUseLosslessZip ? 'zip' : 'none';
+      const effectiveBytes = getEffectiveFormatBytes(fmt, effectiveCompress);
+      const isZip = effectiveCompress === 'zip';
 
       const cleanCustom =
         rawCustomName.trim() &&
@@ -1348,16 +1401,9 @@ export default function App() {
         ? `${cleanCustom}.${isZip ? `${fmt.ext}.zip` : fmt.ext}`
         : isZip
           ? fmt.zipFileName
-          : mode === 'media' && !fmt.fileName.includes('(مضغوط)')
-            ? fmt.fileName.replace(/(\.[^/.]+)$/, ' (مضغوط)$1')
-            : fmt.fileName;
+          : fmt.fileName;
 
-      const baseUrl =
-        mode === 'zip'
-          ? fmt.zipDownloadUrl
-          : mode === 'media'
-            ? fmt.mediaDownloadUrl || fmt.downloadUrl
-            : fmt.downloadUrl;
+      const baseUrl = isZip ? fmt.zipDownloadUrl : fmt.downloadUrl;
       let finalUrl = baseUrl;
       try {
         const parsed = new URL(baseUrl, window.location.origin);
@@ -2260,48 +2306,58 @@ export default function App() {
                 </div>
               )}
 
-              {/* Compression Mode & Custom Filename Row */}
+              {/* Compression Mode (Only shown when Lossless ZIP saves >= 10% without quality loss) & Custom Filename Row */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2 border-t border-slate-800/80">
-                <div className="space-y-1.5">
-                  <label className="block text-[11px] font-semibold text-slate-300">
-                    خيار ضغط الحجم قبل التحميل أو النقل
-                  </label>
-                  <div className="grid grid-cols-3 gap-1.5 p-1 rounded-xl bg-slate-900 border border-slate-800">
-                    <button
-                      type="button"
-                      onClick={() => setExternalCompressMode('none')}
-                      className={`min-h-[36px] px-2 py-1 rounded-lg text-[11px] font-semibold transition cursor-pointer whitespace-nowrap ${
-                        externalCompressMode === 'none'
-                          ? 'bg-slate-800 text-white shadow-sm'
-                          : 'text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      الحجم الأصلي
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setExternalCompressMode('media')}
-                      className={`min-h-[36px] px-2 py-1 rounded-lg text-[11px] font-semibold transition cursor-pointer whitespace-nowrap ${
-                        externalCompressMode === 'media'
-                          ? 'bg-emerald-600 text-white shadow-sm'
-                          : 'text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      تقليص الحجم
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setExternalCompressMode('zip')}
-                      className={`min-h-[36px] px-2 py-1 rounded-lg text-[11px] font-semibold transition cursor-pointer whitespace-nowrap ${
-                        externalCompressMode === 'zip'
-                          ? 'bg-indigo-600 text-white shadow-sm'
-                          : 'text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      ضغط ZIP
-                    </button>
+                {resolvedMediaInfo &&
+                !resolvedMediaInfo.isVideoPlatform &&
+                resolvedMediaInfo.zipEligible &&
+                (resolvedMediaInfo.zipSavedPercent || 0) >= 10 ? (
+                  <div className="space-y-1.5">
+                    <label className="block text-[11px] font-semibold text-emerald-300">
+                      ضغط ZIP بدون فقدان الجودة أو الدقة (توفير ~{resolvedMediaInfo.zipSavedPercent}%)
+                    </label>
+                    <div className="grid grid-cols-2 gap-1.5 p-1 rounded-xl bg-slate-900 border border-slate-800">
+                      <button
+                        type="button"
+                        onClick={() => setExternalCompressMode('none')}
+                        className={`min-h-[38px] px-2.5 py-1 rounded-lg text-[11px] font-semibold transition cursor-pointer whitespace-nowrap ${
+                          externalCompressMode === 'none'
+                            ? 'bg-slate-800 text-white shadow-sm'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        الحجم الأصلي (بدون ضغط)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setExternalCompressMode('zip')}
+                        className={`min-h-[38px] px-2.5 py-1 rounded-lg text-[11px] font-semibold transition cursor-pointer whitespace-nowrap ${
+                          externalCompressMode === 'zip'
+                            ? 'bg-indigo-600 text-white shadow-sm'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        ضغط ZIP (توفير {resolvedMediaInfo.zipSavedPercent}%)
+                      </button>
+                    </div>
                   </div>
-                </div>
+                ) : (
+                  <div className="space-y-1.5">
+                    <label className="block text-[11px] font-semibold text-slate-300">
+                      طريقة التحميل والحفاظ على الدقة
+                    </label>
+                    <div className="min-h-[44px] px-3.5 py-2 rounded-xl bg-slate-900/70 border border-slate-800/90 flex items-center justify-between gap-2 text-xs text-slate-300">
+                      <span className="truncate">
+                        {!resolvedMediaInfo || resolvedMediaInfo.isVideoPlatform
+                          ? 'تحميل مباشر بصيغة الحجم المختارة بدون ضغط إضافي'
+                          : 'تحميل مباشر بالحجم الأصلي (توفير ZIP أقل من 10%)'}
+                      </span>
+                      <span className="text-[11px] text-emerald-400 font-semibold shrink-0">
+                        بدون فقدان الجودة
+                      </span>
+                    </div>
+                  </div>
+                )}
 
                 <div className="space-y-1.5">
                   <label className="block text-[11px] font-semibold text-slate-300">
@@ -2311,7 +2367,7 @@ export default function App() {
                     type="text"
                     value={externalCustomName}
                     onChange={(e) => setExternalCustomName(e.target.value)}
-                    placeholder="اتركه فارغاً لاستخدام عنوان الفيديو الأصلي"
+                    placeholder="اتركه فارغاً لاستخدام عنوان الفيديو أو الملف الأصلي"
                     className="w-full min-h-[44px] px-3.5 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-sky-500"
                   />
                 </div>
@@ -3213,6 +3269,41 @@ export default function App() {
                                     )}
                                     <span>تحميل</span>
                                   </button>
+
+                                  {(() => {
+                                    const zipCheck = evaluateFileLosslessZipInfo(file.name, file.mimeType);
+                                    if (!zipCheck.zipEligible || zipCheck.zipSavedPercent < 10) return null;
+                                    const zipItemKey = `${file.id}_zip`;
+                                    const zipName = file.name.toLowerCase().endsWith('.zip')
+                                      ? file.name
+                                      : `${file.name}.zip`;
+                                    return (
+                                      <button
+                                        type="button"
+                                        disabled={downloadingItemId === zipItemKey}
+                                        onClick={() =>
+                                          handleAuthenticatedProxyDownload(
+                                            `/api/direct-download/${encodeURIComponent(
+                                              zipName
+                                            )}?driveFileId=${encodeURIComponent(file.id)}&compress=zip${
+                                              personalEmail ? `&userEmail=${encodeURIComponent(personalEmail)}` : ''
+                                            }${personalChatId ? `&chatId=${encodeURIComponent(personalChatId)}` : ''}`,
+                                            zipName,
+                                            zipItemKey
+                                          )
+                                        }
+                                        className="px-2.5 py-1 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 font-semibold flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                                        title={`ضغط ZIP بدون فقدان الجودة (توفير ~${zipCheck.zipSavedPercent}%)`}
+                                      >
+                                        {downloadingItemId === zipItemKey ? (
+                                          <Loader2 className="w-3 h-3 animate-spin" />
+                                        ) : (
+                                          <Download className="w-3 h-3" />
+                                        )}
+                                        <span>ZIP (-{zipCheck.zipSavedPercent}%)</span>
+                                      </button>
+                                    );
+                                  })()}
 
                                   <button
                                     onClick={() => copyLink(file.id, file.webViewLink)}

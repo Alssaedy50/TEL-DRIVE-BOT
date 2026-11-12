@@ -1838,18 +1838,88 @@ interface YouTubeMultiStreamResult {
 
 const youtubeMultiStreamCache = new Map<string, YouTubeMultiStreamResult>();
 
+function evaluateLosslessZipEligibility(
+  fileName: string,
+  mimeType: string,
+  isVideoPlatform: boolean,
+  sampledRatio?: number
+): { zipEligible: boolean; zipRatio: number; zipSavedPercent: number } {
+  const lowerName = (fileName || '').toLowerCase();
+  const lowerMime = (mimeType || '').toLowerCase();
+
+  // Videos, compressed audio, and already-compressed archives/images save < 10% with lossless ZIP
+  const isUncompressedMedia = /\.(wav|aiff|pcm|bmp|tiff|tga|raw|svg)$/i.test(lowerName);
+  const isIneligibleMediaOrArchive =
+    isVideoPlatform ||
+    (!isUncompressedMedia &&
+      (lowerMime.startsWith('video/') ||
+        lowerMime.startsWith('audio/') ||
+        /\.(mp4|mkv|webm|mov|avi|flv|m4v|3gp|mp3|m4a|aac|ogg|opus|flac|wma|zip|rar|7z|gz|tgz|bz2|xz|zst|apk|ipa|dmg|deb|rpm|jpg|jpeg|png|webp|gif|heic|avif)$/i.test(
+          lowerName
+        )));
+
+  if (isIneligibleMediaOrArchive) {
+    return { zipEligible: false, zipRatio: 0.985, zipSavedPercent: 2 };
+  }
+
+  // If we measured an empirical lossless DEFLATE sample on the actual stream, use it directly
+  if (typeof sampledRatio === 'number' && sampledRatio > 0.02 && sampledRatio < 1) {
+    const savedPct = Math.max(0, Math.min(92, Math.round((1 - sampledRatio) * 100)));
+    if (savedPct >= 10) {
+      return {
+        zipEligible: true,
+        zipRatio: Math.max(0.08, Number(sampledRatio.toFixed(3))),
+        zipSavedPercent: savedPct,
+      };
+    }
+    return { zipEligible: false, zipRatio: sampledRatio, zipSavedPercent: savedPct };
+  }
+
+  // Known highly compressible lossless formats (>= 10% savings without quality/resolution loss)
+  if (
+    /\.(txt|csv|tsv|json|xml|yaml|yml|sql|log|md|html|htm|css|js|ts|jsx|tsx|py|java|c|cpp|h|cs|php|rb|go|rs|srt|vtt|ass|sub|svg)$/i.test(
+      lowerName
+    ) ||
+    lowerMime.startsWith('text/') ||
+    lowerMime.includes('json') ||
+    lowerMime.includes('xml') ||
+    lowerMime.includes('javascript') ||
+    lowerMime.includes('svg')
+  ) {
+    return { zipEligible: true, zipRatio: 0.38, zipSavedPercent: 62 };
+  }
+
+  if (/\.(bmp|wav|aiff|pcm|tar|iso|psd|ai|eps|ttf|otf|exe|dll|so|bin|db|sqlite|sqlite3|mdb|dbf|vcf|ics)$/i.test(lowerName)) {
+    return { zipEligible: true, zipRatio: 0.62, zipSavedPercent: 38 };
+  }
+
+  if (
+    /\.(pdf|doc|docx|xls|xlsx|ppt|pptx|rtf|odt|ods|odp|epub|mobi)$/i.test(lowerName) ||
+    lowerMime.includes('pdf') ||
+    lowerMime.includes('msword') ||
+    lowerMime.includes('officedocument') ||
+    lowerMime.includes('spreadsheet') ||
+    lowerMime.includes('presentation')
+  ) {
+    return { zipEligible: true, zipRatio: 0.78, zipSavedPercent: 22 };
+  }
+
+  return { zipEligible: false, zipRatio: 0.96, zipSavedPercent: 4 };
+}
+
 async function probeStreamByteSize(
   streamUrl: string,
   customHeaders?: Record<string, string>,
-  timeoutMs = 7000
-): Promise<{ sizeBytes: number; mimeType: string; ok: boolean }> {
+  timeoutMs = 7000,
+  sampleForLosslessZip = false
+): Promise<{ sizeBytes: number; mimeType: string; ok: boolean; sampledDeflateRatio?: number }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(streamUrl, {
       method: 'GET',
       headers: {
-        Range: 'bytes=0-0',
+        Range: sampleForLosslessZip ? 'bytes=0-32767' : 'bytes=0-0',
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         ...(streamUrl.includes('savetube') ? { Referer: 'https://save-tube.com/' } : {}),
@@ -1869,7 +1939,32 @@ async function probeStreamByteSize(
       const parsed = parseInt(cl, 10);
       if (!isNaN(parsed) && parsed > 1) sizeBytes = parsed;
     }
-    await res.body?.cancel().catch(() => {});
+
+    let sampledDeflateRatio: number | undefined;
+    if (sampleForLosslessZip && res.body && !isHtml && !ct.startsWith('video/') && !ct.startsWith('audio/')) {
+      try {
+        const reader = res.body.getReader();
+        const chunks: Uint8Array[] = [];
+        let readBytes = 0;
+        while (readBytes < 32768) {
+          const { done, value } = await reader.read();
+          if (done || !value) break;
+          chunks.push(value);
+          readBytes += value.byteLength;
+        }
+        await reader.cancel().catch(() => {});
+        if (readBytes >= 512) {
+          const sampleBuf = Buffer.concat(chunks.map((c) => Buffer.from(c))).subarray(0, 32768);
+          const deflated = zlib.deflateRawSync(sampleBuf, { level: 6 });
+          sampledDeflateRatio = deflated.byteLength / sampleBuf.byteLength;
+        }
+      } catch {
+        // Ignore sample read error
+      }
+    } else {
+      await res.body?.cancel().catch(() => {});
+    }
+
     if ((!res.ok && res.status !== 206) || isHtml || sizeBytes <= 0) {
       return { sizeBytes: 0, mimeType: '', ok: false };
     }
@@ -1877,6 +1972,7 @@ async function probeStreamByteSize(
       sizeBytes,
       mimeType: ct ? ct.split(';')[0].trim() : 'video/mp4',
       ok: true,
+      sampledDeflateRatio,
     };
   } catch {
     return { sizeBytes: 0, mimeType: '', ok: false };
@@ -4504,18 +4600,12 @@ function buildUrlPromptMessageAndKeyboard(choiceId: string): {
   const pending = pendingUrlChoices.get(choiceId);
   const rawUrl = pending?.url || '';
   const selectedQ = pending?.selectedQuality || adminConfig.defaultQuality || '720';
-  const compMode: CompressMode = pending?.compressMode || adminConfig.defaultCompressMode || 'none';
   const videoPlatform = detectVideoPlatform(rawUrl);
   const appUrl = getAppUrl();
 
-  const compLabelBtn =
-    compMode === 'zip'
-      ? '📦 الضغط قبل النقل: أرشيف ZIP (.zip) ✅'
-      : compMode === 'media'
-      ? '📦 الضغط قبل النقل: تقليص حجم الميديا ✅'
-      : '📦 الضغط قبل النقل: بدون ضغط ⚪';
-
   if (videoPlatform.isVideoPlatform) {
+    // Videos are downloaded directly in their chosen resolution/size tier without ZIP compression (<10% ZIP savings)
+    if (pending) pending.compressMode = 'none';
     const qualities = ['1080', '720', '480', '360', '240'];
     const qualityBtns = qualities.map((q) => ({
       text: `${selectedQ === q ? '✅ ' : '🎬 '}${q}p`,
@@ -4525,7 +4615,6 @@ function buildUrlPromptMessageAndKeyboard(choiceId: string): {
     const rows: any[][] = [
       qualityBtns.slice(0, 3),
       qualityBtns.slice(3),
-      [{ text: compLabelBtn, callback_data: `toggle_url_comp_${choiceId}` }],
       [
         {
           text: `📲 سحب فيديو (${selectedQ}p) إلى تليجرام`,
@@ -4547,10 +4636,10 @@ function buildUrlPromptMessageAndKeyboard(choiceId: string): {
     if (appUrl && appUrl.startsWith('https://')) {
       const dlVideoUrl = `${appUrl}/api/direct-download?url=${encodeURIComponent(
         rawUrl
-      )}&format=video&quality=${encodeURIComponent(selectedQ)}&compress=${encodeURIComponent(compMode)}`;
+      )}&format=video&quality=${encodeURIComponent(selectedQ)}&compress=none`;
       const dlAudioUrl = `${appUrl}/api/direct-download?url=${encodeURIComponent(
         rawUrl
-      )}&format=audio&quality=320&compress=${encodeURIComponent(compMode)}`;
+      )}&format=audio&quality=320&compress=none`;
       rows.push([
         { text: `📥 تحميل مباشر للجهاز (فيديو ${selectedQ}p)`, url: dlVideoUrl },
         { text: '📥 تحميل مباشر (صوت MP3)', url: dlAudioUrl },
@@ -4562,19 +4651,30 @@ function buildUrlPromptMessageAndKeyboard(choiceId: string): {
     const text =
       `🎬 <b>تم التعرف على رابط ${videoPlatform.platformName}!</b>\n` +
       `🔗 <code>${rawUrl}</code>\n\n` +
-      `• <b>جودة الفيديو المحددة:</b> <code>${selectedQ}p</code>\n` +
-      `• <b>خيار ضغط الملف:</b> ${formatCompressModeAr(compMode)}\n\n` +
-      `👇 <b>اختر الجودة وخيار الضغط ثم اضغط على الوجهة أو التحميل المباشر:</b>`;
+      `• <b>صيغة الحجم والدقة المحددة:</b> <code>${selectedQ}p</code> (بدون ضغط إضافي)\n\n` +
+      `👇 <b>اختر الدقة والحجم المناسب ثم اضغط على الوجهة أو التحميل المباشر:</b>`;
 
     return { text, replyMarkup: { inline_keyboard: rows } };
   }
 
   const fileName = extractFilenameFromUrl(rawUrl);
-  const rows: any[][] = [
-    [{ text: compLabelBtn, callback_data: `toggle_url_comp_${choiceId}` }],
+  const zipCheck = evaluateLosslessZipEligibility(fileName, '', false);
+  const compMode: CompressMode =
+    zipCheck.zipEligible && pending?.compressMode === 'zip' ? 'zip' : 'none';
+  if (pending) pending.compressMode = compMode;
+
+  const rows: any[][] = [];
+  if (zipCheck.zipEligible) {
+    const compLabelBtn =
+      compMode === 'zip'
+        ? `📦 ضغط ZIP بدون فقدان الجودة (توفير ~${zipCheck.zipSavedPercent}%) ✅`
+        : `📦 تفعيل ضغط ZIP (توفير ~${zipCheck.zipSavedPercent}% بدون فقدان الجودة) ⚪`;
+    rows.push([{ text: compLabelBtn, callback_data: `toggle_url_comp_${choiceId}` }]);
+  }
+  rows.push(
     [{ text: '☁️ رفعه إلى حسابي Google Drive', callback_data: `url_to_drive_${choiceId}` }],
-    [{ text: '📲 سحبه وإرساله كملف هنا في تليجرام', callback_data: `url_to_tg_${choiceId}` }],
-  ];
+    [{ text: '📲 سحبه وإرساله كملف هنا في تليجرام', callback_data: `url_to_tg_${choiceId}` }]
+  );
 
   if (appUrl && appUrl.startsWith('https://')) {
     const dlFileUrl = `${appUrl}/api/direct-download?url=${encodeURIComponent(
@@ -4588,8 +4688,14 @@ function buildUrlPromptMessageAndKeyboard(choiceId: string): {
   const text =
     `🔗 <b>تم استلام الرابط بنجاح!</b>\n` +
     `📄 <b>الملف المكتشف:</b> <code>${fileName}</code>\n` +
-    `📦 <b>وضع الضغط قبل النقل:</b> ${formatCompressModeAr(compMode)}\n\n` +
-    `👇 <b>اختر ضغط الملف أو وجهته أو التحميل المباشر:</b>`;
+    (zipCheck.zipEligible
+      ? `📦 <b>وضع الضغط بدون فقدان الجودة:</b> ${
+          compMode === 'zip'
+            ? `أرشيف ZIP (توفير ~${zipCheck.zipSavedPercent}%)`
+            : 'الحجم الأصلي (بدون ضغط)'
+        }\n\n`
+      : `📦 <b>الحالة:</b> تحميل مباشر بالحجم الأصلي بدون ضغط\n\n`) +
+    `👇 <b>اختر وجهة النقل أو التحميل المباشر:</b>`;
 
   return { text, replyMarkup: { inline_keyboard: rows } };
 }
@@ -5058,10 +5164,13 @@ async function handleCallbackQuery(callbackQuery: any): Promise<void> {
     const choiceId = data.replace('toggle_url_comp_', '');
     const pending = pendingUrlChoices.get(choiceId);
     if (pending) {
-      const order: CompressMode[] = ['none', 'zip', 'media'];
-      const next = order[(order.indexOf(pending.compressMode || 'none') + 1) % order.length];
+      const next: CompressMode = pending.compressMode === 'zip' ? 'none' : 'zip';
       pending.compressMode = next;
-      await answerCallback(`وضع الضغط: ${formatCompressModeAr(next)} 📦`);
+      await answerCallback(
+        next === 'zip'
+          ? 'تم تفعيل ضغط ZIP بدون فقدان الجودة 📦'
+          : 'تم اختيار الحجم الأصلي بدون ضغط ⚪'
+      );
       const built = buildUrlPromptMessageAndKeyboard(choiceId);
       await editTelegramMessage(chatId, messageId, built.text, built.replyMarkup);
       return;
@@ -6809,6 +6918,7 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
     };
     let totalBytes = 0;
 
+    let sampledDeflateRatio: number | undefined;
     if (ytMulti) {
       const cleanQ = resolvedQuality.replace(/[^0-9]/g, '');
       const selectedEntry =
@@ -6832,11 +6942,17 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
       const probeQuality = platformInfo.isVideoPlatform ? '720' : resolvedQuality;
       resolved = await resolveTelegramPostLinkIfApplicable(cleanUrl, probeFormat, probeQuality);
 
-      const probed = await probeStreamByteSize(resolved.resolvedUrl, resolved.customHeaders, 12000);
+      const probed = await probeStreamByteSize(
+        resolved.resolvedUrl,
+        resolved.customHeaders,
+        12000,
+        !platformInfo.isVideoPlatform
+      );
       if (!probed.ok) {
         throw new Error('تعذر فحص حجم الملف من المصدر أو أن المصدر أعاد صفحة غير صالحة.');
       }
       totalBytes = probed.sizeBytes;
+      sampledDeflateRatio = probed.sampledDeflateRatio;
       if (probed.mimeType) {
         resolved.detectedMimeType = probed.mimeType;
       }
@@ -6853,11 +6969,20 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
     const mimeType =
       resolved.detectedMimeType || (resolvedFormat === 'audio' ? 'audio/mpeg' : 'video/mp4');
 
+    const zipEligibility = evaluateLosslessZipEligibility(
+      fileName,
+      mimeType,
+      platformInfo.isVideoPlatform,
+      sampledDeflateRatio
+    );
+
+    // If ZIP savings are < 10% (e.g., videos, audio, or already-compressed files), disable ZIP and use direct download ('none')
+    const effectiveCompress: CompressMode =
+      !zipEligibility.zipEligible ? 'none' : resolvedCompress === 'zip' ? 'zip' : 'none';
+
     const downloadFileName =
-      resolvedCompress === 'zip' && !fileName.toLowerCase().endsWith('.zip')
+      effectiveCompress === 'zip' && !fileName.toLowerCase().endsWith('.zip')
         ? `${fileName}.zip`
-        : resolvedCompress === 'media' && !fileName.includes('(مضغوط)')
-        ? fileName.replace(/(\.[^/.]+)$/, ' (مضغوط)$1')
         : fileName;
 
     const baseTitle =
@@ -6867,8 +6992,9 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
 
     const durationSec = resolved.durationSec || 0;
 
-    // ZIP mode streams directly via pipeStreamToZipWritable without FFmpeg (~2% DEFLATE savings)
-    const computeZipCompressed = (bytes: number) => Math.max(32 * 1024, Math.round(bytes * 0.985));
+    // Compute lossless ZIP size based on actual DEFLATE ratio for eligible files (>= 10% savings)
+    const computeZipCompressed = (bytes: number) =>
+      Math.max(1024, Math.round(bytes * zipEligibility.zipRatio));
 
     // Only use background FFmpeg worker when video is compact enough (<= 22MB and <= 240s);
     // for larger videos, use the next lower native stream tier so it never relies on long FFmpeg timeouts.
@@ -7208,10 +7334,8 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
       availableFormats.find((f) => f.isSelected) || availableFormats[1] || availableFormats[0];
     const activeBaseBytes = activeSpec ? activeSpec.sizeBytes : totalBytes || base720Bytes;
     const activeCompressedBytes =
-      resolvedCompress === 'zip'
+      effectiveCompress === 'zip'
         ? activeSpec?.zipCompressedBytes || computeZipCompressed(activeBaseBytes)
-        : resolvedCompress === 'media'
-        ? activeSpec?.mediaCompressedBytes || activeBaseBytes
         : activeBaseBytes;
     const savedBytes = Math.max(0, originalBaselineBytes - activeCompressedBytes);
     const savedPercent =
@@ -7222,12 +7346,9 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
     const proxyDownloadUrl = makeProxyUrl({
       fmt: resolvedFormat,
       q: resolvedQuality,
-      comp: resolvedCompress,
+      comp: effectiveCompress,
       fName: fileName,
-      streamSourceUrl:
-        resolvedCompress === 'media'
-          ? activeSpec?.mediaStreamUrl || resolved.resolvedUrl
-          : activeSpec?.sourceStreamUrl || resolved.resolvedUrl,
+      streamSourceUrl: activeSpec?.sourceStreamUrl || resolved.resolvedUrl,
       targetBytes: activeCompressedBytes,
     });
 
@@ -7236,15 +7357,17 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
       title: baseTitle,
       platformName: platformInfo.platformName || 'رابط مباشر',
       isVideoPlatform: platformInfo.isVideoPlatform,
+      zipEligible: zipEligibility.zipEligible,
+      zipSavedPercent: zipEligibility.zipSavedPercent,
       durationSec,
       fileName: downloadFileName,
-      mimeType: resolvedCompress === 'zip' ? 'application/zip' : mimeType,
+      mimeType: effectiveCompress === 'zip' ? 'application/zip' : mimeType,
       totalBytes: activeBaseBytes,
       originalSizeBytes: originalBaselineBytes,
       compressedSizeBytes: activeCompressedBytes,
       savedBytes,
       savedPercent,
-      compressMode: resolvedCompress,
+      compressMode: effectiveCompress,
       effectiveQuality: resolvedQuality,
       directStreamUrl: activeSpec?.sourceStreamUrl || resolved.resolvedUrl,
       proxyDownloadUrl,
