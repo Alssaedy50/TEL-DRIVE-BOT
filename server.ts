@@ -11,6 +11,7 @@ import { TelegramClient, Api, utils, errors } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { CustomFile } from 'telegram/client/uploads.js';
 import bigInt from 'big-integer';
+import ffmpegStatic from 'ffmpeg-static';
 
 const execFileAsync = promisify(execFile);
 
@@ -1766,111 +1767,45 @@ async function resolveYouTubeStream(
     throw new Error('لم يتم التعرف على معرف فيديو يوتيوب (Video ID) من الرابط المرسل.');
   }
 
-  const normalizedYtUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  const ua =
-    'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36';
-
-  const defaultAudioQualities = ['320', '192', '128', '256', '92'];
-  const defaultVideoQualities = ['720', '480', '360', '1080', '240', '144'];
-  const baseOrder = format === 'audio' ? defaultAudioQualities : defaultVideoQualities;
-  const cleanPref = (preferredQuality || '').replace(/[^0-9]/g, '');
-  // When FFmpeg is available locally and user requests a compact video quality (240/360/480),
-  // prefer SaveTube's clean 720p stream over SaveTube's bloated 240p re-encoder so FFmpeg shrinks it accurately.
-  const hasLocalFfmpeg = await isFfmpegAvailable();
-  const effectiveSourcePref =
-    format === 'video' && hasLocalFfmpeg && ['240', '360', '480'].includes(cleanPref)
-      ? '720'
-      : cleanPref;
-  const initialQualities = effectiveSourcePref
-    ? [effectiveSourcePref, ...baseOrder.filter((q) => q !== effectiveSourcePref)]
-    : baseOrder;
-
-  let lastError = '';
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const cdnRes = await fetch('https://media.savetube.vip/api/random-cdn', {
-        signal: AbortSignal.timeout(8000),
-      });
-      if (!cdnRes.ok) {
-        throw new Error(`SaveTube CDN status ${cdnRes.status}`);
+  try {
+    const multi = await resolveYouTubeAllStreams(rawUrl);
+    const cleanPref = (preferredQuality || '').replace(/[^0-9]/g, '');
+    if (format === 'audio') {
+      const qKey = ['320', '192', '128'].includes(cleanPref) ? cleanPref : '320';
+      const entry = multi.audioStreams[qKey] || multi.audioStreams['320'];
+      if (entry && entry.url) {
+        return {
+          resolvedUrl: entry.url,
+          detectedFileName: `${multi.safeTitle} (${qKey}kbps).mp3`,
+          detectedMimeType: 'audio/mpeg',
+          rawTitle: multi.safeTitle,
+          durationSec: multi.durationSec,
+          customHeaders: multi.customHeaders,
+        };
       }
-      const { cdn } = await cdnRes.json();
-      if (!cdn) {
-        throw new Error('لم يتوفر خادم CDN لتحويل يوتيوب');
+    } else {
+      const qKey = ['1080', '720', '480', '360', '240'].includes(cleanPref) ? cleanPref : '720';
+      const entry =
+        multi.videoStreams[qKey] ||
+        multi.videoStreams['720'] ||
+        multi.videoStreams['360'] ||
+        Object.values(multi.videoStreams)[0];
+      if (entry && entry.url) {
+        return {
+          resolvedUrl: entry.url,
+          detectedFileName: `${multi.safeTitle} (${qKey}p).mp4`,
+          detectedMimeType: 'video/mp4',
+          rawTitle: multi.safeTitle,
+          durationSec: multi.durationSec,
+          customHeaders: multi.customHeaders,
+        };
       }
-
-      const infoRes = await fetch(`https://${cdn}/v2/info`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'User-Agent': ua,
-          Referer: 'https://save-tube.com/',
-        },
-        body: JSON.stringify({ url: normalizedYtUrl }),
-        signal: AbortSignal.timeout(12000),
-      });
-
-      const infoJson = await infoRes.json();
-      if (!infoJson?.data) {
-        throw new Error(infoJson?.message || 'تعذر قراءة بيانات فيديو يوتيوب.');
-      }
-
-      const decoded = decodeSaveTubePayload(infoJson.data);
-      const safeTitle = sanitizeMediaTitle(decoded.title, `YouTube_${videoId}`);
-
-      const advertisedQualities: string[] = [];
-      if (format === 'audio' && Array.isArray(decoded.audio_formats)) {
-        for (const af of decoded.audio_formats) {
-          if (af?.quality) advertisedQualities.push(String(af.quality));
-        }
-      } else if (format === 'video' && Array.isArray(decoded.video_formats)) {
-        for (const vf of decoded.video_formats) {
-          if (vf?.quality) advertisedQualities.push(String(vf.quality));
-          else if (vf?.height) advertisedQualities.push(String(vf.height));
-        }
-      }
-
-      const uniqueQualities = Array.from(new Set([...initialQualities, ...advertisedQualities]));
-
-      for (const q of uniqueQualities) {
-        const dlRes = await fetch(`https://${cdn}/download`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'User-Agent': ua,
-            Referer: 'https://save-tube.com/',
-          },
-          body: JSON.stringify({
-            downloadType: format === 'audio' ? 'audio' : 'video',
-            quality: q,
-            key: decoded.key,
-          }),
-          signal: AbortSignal.timeout(15000),
-        });
-
-        const dlJson = await dlRes.json();
-        const downloadUrl = dlJson?.data?.downloadUrl;
-        if (downloadUrl && typeof downloadUrl === 'string' && downloadUrl.startsWith('http')) {
-          const isAudio = format === 'audio';
-          const badge = cleanPref || q;
-          return {
-            resolvedUrl: downloadUrl,
-            detectedFileName: isAudio ? `${safeTitle} (${badge}kbps).mp3` : `${safeTitle} (${badge}p).mp4`,
-            detectedMimeType: isAudio ? 'audio/mpeg' : 'video/mp4',
-            rawTitle: safeTitle,
-            durationSec: Number(decoded.duration) || 0,
-            customHeaders: {
-              'User-Agent': ua,
-              Referer: 'https://save-tube.com/',
-            },
-          };
-        }
-      }
-    } catch (err: any) {
-      lastError = err?.message || 'خطأ في استخراج فيديو يوتيوب';
     }
+  } catch (err: any) {
+    console.warn('resolveYouTubeAllStreams primary error:', err?.message);
   }
 
+  const normalizedYtUrl = `https://www.youtube.com/watch?v=${videoId}`;
   // Fallback to standalone yt-dlp binary if SaveTube fails
   try {
     return await resolveWithYtDlpBinary(normalizedYtUrl, format, preferredQuality);
@@ -1878,7 +1813,323 @@ async function resolveYouTubeStream(
     console.warn('yt-dlp fallback failed for YouTube URL:', ytDlpErr?.message);
   }
 
-  throw new Error(`تعذر سحب فيديو يوتيوب حالياً (${lastError}). تأكد من أن الفيديو عام وليس خاصاً.`);
+  throw new Error('تعذر سحب فيديو يوتيوب حالياً. تأكد من أن الفيديو عام وليس خاصاً.');
+}
+
+interface ProbedStreamInfo {
+  quality: string;
+  url: string;
+  probedBytes: number;
+  sizeBytes: number;
+  needsTranscode: boolean;
+  mimeType: string;
+}
+
+interface YouTubeMultiStreamResult {
+  videoId: string;
+  safeTitle: string;
+  durationSec: number;
+  originalMaxBytes: number;
+  customHeaders: Record<string, string>;
+  videoStreams: Record<string, ProbedStreamInfo>;
+  audioStreams: Record<string, ProbedStreamInfo>;
+  createdAt: number;
+}
+
+const youtubeMultiStreamCache = new Map<string, YouTubeMultiStreamResult>();
+
+async function probeStreamByteSize(
+  streamUrl: string,
+  customHeaders?: Record<string, string>,
+  timeoutMs = 7000
+): Promise<{ sizeBytes: number; mimeType: string; ok: boolean }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(streamUrl, {
+      method: 'GET',
+      headers: {
+        Range: 'bytes=0-0',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        ...(streamUrl.includes('savetube') ? { Referer: 'https://save-tube.com/' } : {}),
+        ...(customHeaders || {}),
+      },
+      signal: controller.signal,
+    });
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    const isHtml = ct.includes('text/html');
+    let sizeBytes = 0;
+    const cr = res.headers.get('content-range');
+    const cl = res.headers.get('content-length');
+    if (cr && cr.includes('/')) {
+      const parsed = parseInt(cr.split('/')[1], 10);
+      if (!isNaN(parsed) && parsed > 0) sizeBytes = parsed;
+    } else if (cl) {
+      const parsed = parseInt(cl, 10);
+      if (!isNaN(parsed) && parsed > 1) sizeBytes = parsed;
+    }
+    await res.body?.cancel().catch(() => {});
+    if ((!res.ok && res.status !== 206) || isHtml || sizeBytes <= 0) {
+      return { sizeBytes: 0, mimeType: '', ok: false };
+    }
+    return {
+      sizeBytes,
+      mimeType: ct ? ct.split(';')[0].trim() : 'video/mp4',
+      ok: true,
+    };
+  } catch {
+    return { sizeBytes: 0, mimeType: '', ok: false };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function resolveYouTubeAllStreams(rawUrl: string): Promise<YouTubeMultiStreamResult> {
+  const videoId = extractYouTubeId(rawUrl);
+  if (!videoId) {
+    throw new Error('لم يتم التعرف على معرف فيديو يوتيوب (Video ID) من الرابط المرسل.');
+  }
+
+  const cached = youtubeMultiStreamCache.get(videoId);
+  if (cached && Date.now() - cached.createdAt < 180_000) {
+    return cached;
+  }
+
+  const normalizedYtUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const ua =
+    'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36';
+  const customHeaders = {
+    'User-Agent': ua,
+    Referer: 'https://save-tube.com/',
+  };
+
+  let lastError = '';
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const cdnRes = await fetch('https://media.savetube.vip/api/random-cdn', {
+        signal: AbortSignal.timeout(7000),
+      });
+      if (!cdnRes.ok) throw new Error(`SaveTube CDN status ${cdnRes.status}`);
+      const { cdn } = await cdnRes.json();
+      if (!cdn) throw new Error('لم يتوفر خادم CDN لتحويل يوتيوب');
+
+      const infoRes = await fetch(`https://${cdn}/v2/info`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...customHeaders,
+        },
+        body: JSON.stringify({ url: normalizedYtUrl }),
+        signal: AbortSignal.timeout(10000),
+      });
+      const infoJson = await infoRes.json();
+      if (!infoJson?.data) {
+        throw new Error(infoJson?.message || 'تعذر قراءة بيانات فيديو يوتيوب.');
+      }
+
+      const decoded = decodeSaveTubePayload(infoJson.data);
+      const safeTitle = sanitizeMediaTitle(decoded.title, `YouTube_${videoId}`);
+      const durationSec = Number(decoded.duration) || 0;
+
+      const videoQualities = ['1080', '720', '480', '360', '240'];
+      const fetchAndProbe = async (dlType: 'video' | 'audio', q: string) => {
+        try {
+          const dlRes = await fetch(`https://${cdn}/download`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...customHeaders,
+            },
+            body: JSON.stringify({
+              downloadType: dlType,
+              quality: q,
+              key: decoded.key,
+            }),
+            signal: AbortSignal.timeout(10000),
+          });
+          const dlJson = await dlRes.json();
+          const dlUrl = dlJson?.data?.downloadUrl;
+          if (!dlUrl || typeof dlUrl !== 'string' || !dlUrl.startsWith('http')) {
+            return { q, dlType, url: '', probedBytes: 0, mimeType: '' };
+          }
+          const probed = await probeStreamByteSize(dlUrl, customHeaders, 6500);
+          return {
+            q,
+            dlType,
+            url: dlUrl,
+            probedBytes: probed.ok ? probed.sizeBytes : 0,
+            mimeType: probed.mimeType || (dlType === 'audio' ? 'audio/mpeg' : 'video/mp4'),
+          };
+        } catch {
+          return { q, dlType, url: '', probedBytes: 0, mimeType: '' };
+        }
+      };
+
+      const rawProbes = await Promise.all([
+        ...videoQualities.map((q) => fetchAndProbe('video', q)),
+        fetchAndProbe('audio', '128'),
+      ]);
+
+      const rawVideoMap: Record<string, { url: string; probedBytes: number; mimeType: string }> = {};
+      let rawAudio = { url: '', probedBytes: 0, mimeType: 'audio/mpeg' };
+      for (const item of rawProbes) {
+        if (item.dlType === 'audio') {
+          rawAudio = { url: item.url, probedBytes: item.probedBytes, mimeType: item.mimeType };
+        } else if (item.url && item.probedBytes > 0) {
+          rawVideoMap[item.q] = {
+            url: item.url,
+            probedBytes: item.probedBytes,
+            mimeType: item.mimeType,
+          };
+        }
+      }
+
+      // Find at least one valid video stream
+      const firstValidVideo =
+        rawVideoMap['720'] ||
+        rawVideoMap['1080'] ||
+        rawVideoMap['480'] ||
+        rawVideoMap['360'] ||
+        rawVideoMap['240'];
+      if (!firstValidVideo) {
+        throw new Error('لم يتم العثور على مسار فيديو صالح من المصدر.');
+      }
+
+      const hasFfmpeg = await isFfmpegAvailable();
+      const videoStreams: Record<string, ProbedStreamInfo> = {};
+
+      // Ensure 1080p baseline exists
+      const base720 = rawVideoMap['720'] || firstValidVideo;
+      if (rawVideoMap['1080'] && rawVideoMap['1080'].probedBytes >= base720.probedBytes) {
+        videoStreams['1080'] = {
+          quality: '1080',
+          url: rawVideoMap['1080'].url,
+          probedBytes: rawVideoMap['1080'].probedBytes,
+          sizeBytes: rawVideoMap['1080'].probedBytes,
+          needsTranscode: false,
+          mimeType: 'video/mp4',
+        };
+      } else {
+        videoStreams['1080'] = {
+          quality: '1080',
+          url: rawVideoMap['1080']?.url || base720.url,
+          probedBytes: rawVideoMap['1080']?.probedBytes || base720.probedBytes,
+          sizeBytes: rawVideoMap['1080']?.probedBytes || base720.probedBytes,
+          needsTranscode: false,
+          mimeType: 'video/mp4',
+        };
+      }
+
+      let smallestClean: { url: string; sizeBytes: number; quality: string } = {
+        url: videoStreams['1080'].url,
+        sizeBytes: videoStreams['1080'].sizeBytes,
+        quality: '1080',
+      };
+
+      const stepFallbackFactors: Record<string, number> = {
+        '720': 0.62,
+        '480': 0.68,
+        '360': 0.68,
+        '240': 0.65,
+      };
+
+      for (const q of ['720', '480', '360', '240']) {
+        const candidate = rawVideoMap[q];
+        // A lower resolution stream is clean if its real probed byte size is strictly smaller than the previous tier
+        if (candidate && candidate.probedBytes > 0 && candidate.probedBytes < smallestClean.sizeBytes * 0.98) {
+          videoStreams[q] = {
+            quality: q,
+            url: candidate.url,
+            probedBytes: candidate.probedBytes,
+            sizeBytes: candidate.probedBytes,
+            needsTranscode: false,
+            mimeType: 'video/mp4',
+          };
+          smallestClean = {
+            url: candidate.url,
+            sizeBytes: candidate.probedBytes,
+            quality: q,
+          };
+        } else {
+          // Candidate is missing or bloated (like SaveTube's 240p on Shorts):
+          // Use the smallest clean stream URL as source and transcode via FFmpeg if available
+          const targetShrunk = hasFfmpeg
+            ? Math.max(64 * 1024, Math.round(smallestClean.sizeBytes * (stepFallbackFactors[q] || 0.68)))
+            : smallestClean.sizeBytes;
+          videoStreams[q] = {
+            quality: q,
+            url: smallestClean.url,
+            probedBytes: smallestClean.sizeBytes,
+            sizeBytes: targetShrunk,
+            needsTranscode: hasFfmpeg && targetShrunk < smallestClean.sizeBytes,
+            mimeType: 'video/mp4',
+          };
+          smallestClean = {
+            url: smallestClean.url,
+            sizeBytes: targetShrunk,
+            quality: q,
+          };
+        }
+      }
+
+      const audioStreams: Record<string, ProbedStreamInfo> = {};
+      const audioSourceUrl = rawAudio.url || smallestClean.url;
+      const audioBaseBytes =
+        rawAudio.probedBytes > 0
+          ? rawAudio.probedBytes
+          : hasFfmpeg && durationSec > 0
+          ? Math.min(smallestClean.sizeBytes, Math.round(durationSec * 16500))
+          : smallestClean.sizeBytes;
+      const audioIsNativeMp3 = Boolean(rawAudio.url && rawAudio.probedBytes > 0);
+
+      audioStreams['320'] = {
+        quality: '320',
+        url: audioSourceUrl,
+        probedBytes: audioBaseBytes,
+        sizeBytes: audioBaseBytes,
+        needsTranscode: !audioIsNativeMp3,
+        mimeType: 'audio/mpeg',
+      };
+      audioStreams['192'] = {
+        quality: '192',
+        url: audioSourceUrl,
+        probedBytes: audioBaseBytes,
+        sizeBytes: hasFfmpeg ? Math.round(audioBaseBytes * 0.72) : audioBaseBytes,
+        needsTranscode: hasFfmpeg,
+        mimeType: 'audio/mpeg',
+      };
+      audioStreams['128'] = {
+        quality: '128',
+        url: audioSourceUrl,
+        probedBytes: audioBaseBytes,
+        sizeBytes: hasFfmpeg ? Math.round(audioBaseBytes * 0.52) : audioBaseBytes,
+        needsTranscode: hasFfmpeg,
+        mimeType: 'audio/mpeg',
+      };
+
+      const originalMaxBytes = Math.max(
+        videoStreams['1080'].sizeBytes,
+        ...Object.values(videoStreams).map((s) => s.sizeBytes)
+      );
+
+      const result: YouTubeMultiStreamResult = {
+        videoId,
+        safeTitle,
+        durationSec,
+        originalMaxBytes,
+        customHeaders,
+        videoStreams,
+        audioStreams,
+        createdAt: Date.now(),
+      };
+      youtubeMultiStreamCache.set(videoId, result);
+      return result;
+    } catch (err: any) {
+      lastError = err?.message || 'خطأ في فحص صيغ يوتيوب';
+    }
+  }
+  throw new Error(lastError || 'تعذر فحص صيغ الفيديو من يوتيوب.');
 }
 
 async function resolveTikTokStream(
@@ -2206,16 +2457,46 @@ function updateCrc32(crc: number, buf: Uint8Array): number {
   return (c ^ 0xffffffff) >>> 0;
 }
 
-let cachedFfmpegAvailable: boolean | null = null;
-async function isFfmpegAvailable(): Promise<boolean> {
-  if (cachedFfmpegAvailable !== null) return cachedFfmpegAvailable;
-  try {
-    await execFileAsync('ffmpeg', ['-version'], { timeout: 3000 });
-    cachedFfmpegAvailable = true;
-  } catch {
-    cachedFfmpegAvailable = false;
+let cachedFfmpegBinary: string | null | undefined = undefined;
+
+async function getFfmpegBinary(): Promise<string | null> {
+  if (cachedFfmpegBinary !== undefined) return cachedFfmpegBinary;
+
+  const candidates: string[] = ['ffmpeg'];
+  if (typeof ffmpegStatic === 'string' && ffmpegStatic) {
+    candidates.push(ffmpegStatic);
   }
-  return cachedFfmpegAvailable;
+
+  for (const bin of candidates) {
+    try {
+      await execFileAsync(bin, ['-version'], { timeout: 3500 });
+      cachedFfmpegBinary = bin;
+      return bin;
+    } catch {
+      if (bin !== 'ffmpeg' && fs.existsSync(bin)) {
+        try {
+          const tmpBin = '/tmp/ffmpeg_static_bin';
+          if (!fs.existsSync(tmpBin)) {
+            fs.copyFileSync(bin, tmpBin);
+            fs.chmodSync(tmpBin, 0o755);
+          }
+          await execFileAsync(tmpBin, ['-version'], { timeout: 3500 });
+          cachedFfmpegBinary = tmpBin;
+          return tmpBin;
+        } catch {
+          // Continue
+        }
+      }
+    }
+  }
+
+  cachedFfmpegBinary = null;
+  return null;
+}
+
+async function isFfmpegAvailable(): Promise<boolean> {
+  const bin = await getFfmpegBinary();
+  return Boolean(bin);
 }
 
 async function writeBufferToStream(out: NodeJS.WritableStream, buf: Buffer): Promise<void> {
@@ -2370,10 +2651,27 @@ async function probeLocalMediaDuration(filePath: string): Promise<number> {
       { timeout: 5000 }
     );
     const parsed = parseFloat(stdout.trim());
-    return !isNaN(parsed) && parsed > 0 ? parsed : 0;
+    if (!isNaN(parsed) && parsed > 0) return parsed;
   } catch {
-    return 0;
+    // Fallback to parsing Duration from ffmpeg -i stderr when ffprobe is not installed (e.g. Vercel ffmpeg-static)
   }
+
+  const ffmpegBin = await getFfmpegBinary();
+  if (!ffmpegBin) return 0;
+  try {
+    await execFileAsync(ffmpegBin, ['-i', filePath], { timeout: 5000 });
+  } catch (err: any) {
+    const stderr = String(err?.stderr || err?.message || '');
+    const match = stderr.match(/Duration:\s*(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)/i);
+    if (match) {
+      const hours = parseInt(match[1], 10) || 0;
+      const mins = parseInt(match[2], 10) || 0;
+      const secs = parseFloat(match[3]) || 0;
+      const total = hours * 3600 + mins * 60 + secs;
+      if (total > 0) return total;
+    }
+  }
+  return 0;
 }
 
 export interface MediaProcessOptions {
@@ -2397,11 +2695,11 @@ async function compressLocalFile(
   wasCompressed: boolean;
 }> {
   let currentPath = inputPath;
-  let currentFileName = originalFileName;
+  let currentFileName = originalFileName.replace(/\.zip$/i, '');
   let currentMimeType = originalMimeType;
   let wasCompressed = false;
 
-  const lowerName = originalFileName.toLowerCase();
+  const lowerName = currentFileName.toLowerCase();
   const isVideo =
     originalMimeType.startsWith('video/') ||
     /\.(mp4|mkv|mov|webm|avi|flv)$/i.test(lowerName) ||
@@ -2416,14 +2714,26 @@ async function compressLocalFile(
   const targetBytes = options?.targetBytes && options.targetBytes > 0 ? options.targetBytes : 0;
   const cleanQ = (options?.targetQuality || '').replace(/[^0-9]/g, '');
 
+  // When compressMode === 'zip', raw DEFLATE only shrinks MP4/MP3 by ~3%, so if inputBytes > targetBytes,
+  // we must first transcode the media down to <= 90% of targetBytes before zipping so the final .zip is strictly <= targetBytes.
+  const effectiveMediaBudget =
+    targetBytes > 0
+      ? compressMode === 'zip'
+        ? Math.floor(targetBytes * 0.90)
+        : targetBytes
+      : compressMode === 'media' && inputBytes > 0
+      ? Math.floor(inputBytes * 0.65)
+      : 0;
+
   const needsMediaTranscode =
     compressMode === 'media' ||
-    (wantAudioOnly && (!originalMimeType.startsWith('audio/mpeg') || (targetBytes > 0 && inputBytes > targetBytes * 1.02))) ||
-    (targetBytes > 0 && inputBytes > targetBytes * 1.02) ||
-    (isVideo && !wantAudioOnly && ['240', '360', '480'].includes(cleanQ) && (targetBytes === 0 || inputBytes > targetBytes * 0.95));
+    (wantAudioOnly && !originalMimeType.startsWith('audio/mpeg')) ||
+    (effectiveMediaBudget > 0 && inputBytes > effectiveMediaBudget);
 
-  // Stage 1: FFmpeg Resolution / Bitrate / Target-Size Transcoding (when FFmpeg is available)
-  if (needsMediaTranscode && (isVideo || isAudio) && (await isFfmpegAvailable())) {
+  const ffmpegBin = await getFfmpegBinary();
+
+  // Stage 1: FFmpeg Resolution / Bitrate / Strict Target-Size Transcoding
+  if (needsMediaTranscode && (isVideo || isAudio) && ffmpegBin) {
     const ext = wantAudioOnly ? '.mp3' : '.mp4';
     const baseWithoutExt = currentFileName.replace(/\.zip$/i, '').replace(/\.[^/.]+$/, '');
     const outMediaPath = `${inputPath}_transcoded${ext}`;
@@ -2435,25 +2745,22 @@ async function compressLocalFile(
           : await probeLocalMediaDuration(inputPath);
       const dur = Math.max(1, probedDur || 60);
 
-      // Compute exact byte budget so output strictly respects the promised size
       const desiredBytes =
-        targetBytes > 0
-          ? targetBytes
-          : compressMode === 'media' && inputBytes > 0
-          ? Math.round(inputBytes * 0.62)
+        effectiveMediaBudget > 0
+          ? effectiveMediaBudget
           : inputBytes > 0
-          ? Math.round(inputBytes * 0.65)
+          ? Math.floor(inputBytes * 0.65)
           : 0;
 
       if (wantAudioOnly) {
         const reqAudioKbps = parseInt(cleanQ || '128', 10) || 128;
         const maxKbpsBySize =
-          desiredBytes > 0 ? Math.floor((desiredBytes * 8 * 0.90) / (dur * 1000)) : reqAudioKbps;
-        const audioKbps = Math.max(20, Math.min(reqAudioKbps, maxKbpsBySize));
+          desiredBytes > 0 ? Math.floor((desiredBytes * 8 * 0.88) / (dur * 1000)) : reqAudioKbps;
+        const audioKbps = Math.max(16, Math.min(reqAudioKbps, maxKbpsBySize));
 
         const runAudioEncode = async (kbps: number) => {
           await execFileAsync(
-            'ffmpeg',
+            ffmpegBin,
             [
               '-y',
               '-i',
@@ -2476,8 +2783,8 @@ async function compressLocalFile(
         await runAudioEncode(audioKbps);
         if (desiredBytes > 0 && fs.existsSync(outMediaPath)) {
           const outStat = fs.statSync(outMediaPath);
-          if (outStat.size > desiredBytes * 1.03 && audioKbps > 20) {
-            const retryKbps = Math.max(16, Math.floor(audioKbps * (desiredBytes / outStat.size) * 0.88));
+          if (outStat.size > desiredBytes && audioKbps > 16) {
+            const retryKbps = Math.max(12, Math.floor(audioKbps * (desiredBytes / outStat.size) * 0.86));
             await runAudioEncode(retryKbps);
           }
         }
@@ -2492,13 +2799,13 @@ async function compressLocalFile(
         const fps = targetShortSide <= 240 ? '20' : targetShortSide <= 360 ? '24' : '30';
 
         if (desiredBytes > 0) {
-          const totalKbps = Math.max(26, Math.floor((desiredBytes * 8 * 0.86) / (dur * 1000)));
-          const audioKbps = Math.max(16, Math.min(96, Math.floor(totalKbps * 0.25)));
-          const videoKbps = Math.max(14, totalKbps - audioKbps);
+          const totalKbps = Math.max(24, Math.floor((desiredBytes * 8 * 0.84) / (dur * 1000)));
+          const audioKbps = Math.max(16, Math.min(64, Math.floor(totalKbps * 0.22)));
+          const videoKbps = Math.max(12, totalKbps - audioKbps);
 
           const runVideoBitrateEncode = async (vKbps: number, aKbps: number) => {
             await execFileAsync(
-              'ffmpeg',
+              ffmpegBin,
               [
                 '-y',
                 '-i',
@@ -2538,16 +2845,16 @@ async function compressLocalFile(
           await runVideoBitrateEncode(videoKbps, audioKbps);
           if (fs.existsSync(outMediaPath)) {
             const outStat = fs.statSync(outMediaPath);
-            if (outStat.size > desiredBytes * 1.03 && videoKbps > 14) {
-              const ratio = (desiredBytes / outStat.size) * 0.85;
-              const retryVKbps = Math.max(12, Math.floor(videoKbps * ratio));
+            if (outStat.size > desiredBytes && videoKbps > 12) {
+              const ratio = (desiredBytes / outStat.size) * 0.84;
+              const retryVKbps = Math.max(10, Math.floor(videoKbps * ratio));
               const retryAKbps = Math.max(12, Math.floor(audioKbps * ratio));
               await runVideoBitrateEncode(retryVKbps, retryAKbps);
             }
           }
         } else {
           await execFileAsync(
-            'ffmpeg',
+            ffmpegBin,
             [
               '-y',
               '-i',
@@ -2589,7 +2896,7 @@ async function compressLocalFile(
     }
   }
 
-  // Stage 2: Optional Pure Node.js ZIP Archive Compression (.zip)
+  // Stage 2: Pure Node.js ZIP Archive Compression (.zip)
   if (compressMode === 'zip') {
     if (currentFileName.toLowerCase().endsWith('.zip')) {
       return {
@@ -6438,16 +6745,7 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
   try {
     // When media compression is selected on serverless (no FFmpeg), automatically target a compact stream quality
     const platformInfo = detectVideoPlatform(cleanUrl);
-    // For video platforms (YouTube, TikTok, etc.), always probe the 720p muxed video stream as the baseline
-    // so that all 8 format sizes (1080p..240p & MP3) and sourceUrl are 100% consistent regardless of active UI state.
-    const probeFormat: 'video' | 'audio' = platformInfo.isVideoPlatform ? 'video' : resolvedFormat;
-    const probeQuality = platformInfo.isVideoPlatform ? '720' : resolvedQuality;
-
-    const resolved = await resolveTelegramPostLinkIfApplicable(
-      cleanUrl,
-      probeFormat,
-      probeQuality
-    );
+    const hasFfmpeg = await isFfmpegAvailable();
 
     // Prevent URLs accidentally pasted into customFileName from becoming the file name
     let safeCustomName = typeof customFileName === 'string' ? customFileName.trim() : '';
@@ -6462,6 +6760,58 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
     }
     safeCustomName = safeCustomName.replace(/[\\/:*?"<>|\r\n]+/g, ' ').trim();
 
+    let ytMulti: YouTubeMultiStreamResult | null = null;
+    if (platformInfo.isYouTube) {
+      try {
+        ytMulti = await resolveYouTubeAllStreams(cleanUrl);
+      } catch (e: any) {
+        console.warn('Multi-stream YouTube probe fallback:', e?.message);
+      }
+    }
+
+    let resolved: {
+      resolvedUrl: string;
+      detectedFileName?: string;
+      detectedMimeType?: string;
+      rawTitle?: string;
+      durationSec?: number;
+      customHeaders?: Record<string, string>;
+    };
+    let totalBytes = 0;
+
+    if (ytMulti) {
+      const cleanQ = resolvedQuality.replace(/[^0-9]/g, '');
+      const selectedEntry =
+        resolvedFormat === 'audio'
+          ? ytMulti.audioStreams[cleanQ] || ytMulti.audioStreams['320']
+          : ytMulti.videoStreams[cleanQ] || ytMulti.videoStreams['720'] || Object.values(ytMulti.videoStreams)[0];
+      resolved = {
+        resolvedUrl: selectedEntry.url,
+        detectedFileName:
+          resolvedFormat === 'audio'
+            ? `${ytMulti.safeTitle} (${selectedEntry.quality}kbps).mp3`
+            : `${ytMulti.safeTitle} (${selectedEntry.quality}p).mp4`,
+        detectedMimeType: selectedEntry.mimeType,
+        rawTitle: ytMulti.safeTitle,
+        durationSec: ytMulti.durationSec,
+        customHeaders: ytMulti.customHeaders,
+      };
+      totalBytes = selectedEntry.sizeBytes;
+    } else {
+      const probeFormat: 'video' | 'audio' = platformInfo.isVideoPlatform ? 'video' : resolvedFormat;
+      const probeQuality = platformInfo.isVideoPlatform ? '720' : resolvedQuality;
+      resolved = await resolveTelegramPostLinkIfApplicable(cleanUrl, probeFormat, probeQuality);
+
+      const probed = await probeStreamByteSize(resolved.resolvedUrl, resolved.customHeaders, 12000);
+      if (!probed.ok) {
+        throw new Error('تعذر فحص حجم الملف من المصدر أو أن المصدر أعاد صفحة غير صالحة.');
+      }
+      totalBytes = probed.sizeBytes;
+      if (probed.mimeType) {
+        resolved.detectedMimeType = probed.mimeType;
+      }
+    }
+
     let fileName = safeCustomName || '';
     if (!fileName) {
       fileName = resolved.detectedFileName || extractFilenameFromUrl(cleanUrl, resolvedFormat);
@@ -6470,53 +6820,8 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
       fileName += extMatch ? extMatch[1] : resolvedFormat === 'audio' ? '.mp3' : '.mp4';
     }
 
-    let mimeType =
+    const mimeType =
       resolved.detectedMimeType || (resolvedFormat === 'audio' ? 'audio/mpeg' : 'video/mp4');
-    let totalBytes = 0;
-
-    // Probe the resolved stream to verify it is not an HTML error page and obtain its size
-    const probeController = new AbortController();
-    const probeTimeout = setTimeout(() => probeController.abort(), 12000);
-    try {
-      const probeRes = await fetch(resolved.resolvedUrl, {
-        method: 'GET',
-        headers: {
-          Range: 'bytes=0-0',
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-          ...(resolved.resolvedUrl.includes('savetube') ? { Referer: 'https://save-tube.com/' } : {}),
-          ...(resolved.customHeaders || {}),
-        },
-        signal: probeController.signal,
-      });
-
-      const ct = (probeRes.headers.get('content-type') || '').toLowerCase();
-      if (!probeRes.ok && probeRes.status !== 206) {
-        await probeRes.body?.cancel().catch(() => {});
-        throw new Error(`المصدر رفض التحميل (${probeRes.status}).`);
-      }
-      if (ct.includes('text/html') && !fileName.toLowerCase().endsWith('.html')) {
-        await probeRes.body?.cancel().catch(() => {});
-        throw new Error('المصدر أعاد صفحة HTML بدلاً من ملف الفيديو أو الصوت.');
-      }
-
-      const contentRange = probeRes.headers.get('content-range');
-      const contentLen = probeRes.headers.get('content-length');
-      if (contentRange && contentRange.includes('/')) {
-        const totalPart = parseInt(contentRange.split('/')[1], 10);
-        if (!isNaN(totalPart) && totalPart > 0) totalBytes = totalPart;
-      } else if (contentLen) {
-        const parsedLen = parseInt(contentLen, 10);
-        if (!isNaN(parsedLen) && parsedLen > 1) totalBytes = parsedLen;
-      }
-
-      if (ct && !ct.includes('application/octet-stream')) {
-        mimeType = ct.split(';')[0].trim();
-      }
-      await probeRes.body?.cancel().catch(() => {});
-    } finally {
-      clearTimeout(probeTimeout);
-    }
 
     const downloadFileName =
       resolvedCompress === 'zip' && !fileName.toLowerCase().endsWith('.zip')
@@ -6532,25 +6837,30 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
 
     const durationSec = resolved.durationSec || 0;
 
-    // Calculate reference 720p byte size from the probed 720p stream so all format sizes are consistent
-    const qualityMultipliers: Record<string, number> = {
-      '1080': 1.85,
-      '720': 1.0,
-      '480': 0.56,
-      '360': 0.35,
-      '240': 0.22,
-      '320': 0.25,
-      '192': 0.16,
-      '128': 0.11,
-    };
-    const base720Bytes =
-      totalBytes > 0
-        ? totalBytes
-        : durationSec > 0
-        ? durationSec * 165000
-        : 12 * 1024 * 1024;
+    const computeMediaCompressed = (bytes: number) =>
+      hasFfmpeg ? Math.max(32 * 1024, Math.round(bytes * 0.65)) : bytes;
+    const computeZipCompressed = (bytes: number) =>
+      hasFfmpeg ? Math.max(32 * 1024, Math.round(bytes * 0.85)) : Math.round(bytes * 0.975);
 
-    const max1080Bytes = Math.round(base720Bytes * qualityMultipliers['1080']);
+    const qualityMultipliers: Record<string, number> = {
+      '1080': 1.65,
+      '720': 1.0,
+      '480': 0.66,
+      '360': 0.48,
+      '240': 0.34,
+      '320': 0.28,
+      '192': 0.20,
+      '128': 0.14,
+    };
+
+    const base720Bytes =
+      ytMulti?.videoStreams['720']?.sizeBytes ||
+      (totalBytes > 0 ? totalBytes : durationSec > 0 ? durationSec * 165000 : 12 * 1024 * 1024);
+
+    const max1080Bytes =
+      ytMulti?.originalMaxBytes ||
+      (platformInfo.isVideoPlatform ? Math.round(base720Bytes * qualityMultipliers['1080']) : totalBytes);
+
     const originalBaselineBytes = platformInfo.isVideoPlatform ? max1080Bytes : totalBytes;
 
     const makeProxyUrl = (opts: {
@@ -6558,22 +6868,24 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
       q: string;
       comp: CompressMode;
       fName: string;
-      useDirectResolved: boolean;
-      targetBytes?: number;
+      streamSourceUrl: string;
+      targetBytes: number;
     }) => {
       const targetDownloadName =
         opts.comp === 'zip' && !opts.fName.toLowerCase().endsWith('.zip')
           ? `${opts.fName}.zip`
+          : opts.comp === 'media' && !opts.fName.includes('(مضغوط)')
+          ? opts.fName.replace(/(\.[^/.]+)$/, ' (مضغوط)$1')
           : opts.fName;
       const p = new URLSearchParams({
-        url: opts.useDirectResolved ? resolved.resolvedUrl : cleanUrl,
+        url: cleanUrl,
         format: opts.fmt,
         quality: opts.q,
         compress: opts.comp,
         name: opts.fName,
       });
-      if (resolved.resolvedUrl) {
-        p.set('sourceUrl', resolved.resolvedUrl);
+      if (opts.streamSourceUrl) {
+        p.set('sourceUrl', opts.streamSourceUrl);
       }
       if (opts.targetBytes && opts.targetBytes > 0) {
         p.set('targetBytes', String(opts.targetBytes));
@@ -6597,11 +6909,15 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
       badge: string;
       ext: string;
       sizeBytes: number;
+      mediaCompressedBytes: number;
+      zipCompressedBytes: number;
       savedPercent: number;
       isSelected: boolean;
       fileName: string;
       zipFileName: string;
+      sourceStreamUrl: string;
       downloadUrl: string;
+      mediaDownloadUrl: string;
       zipDownloadUrl: string;
     }> = [];
 
@@ -6683,28 +6999,31 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
       for (const spec of formatSpecs) {
         const isSelectedSpec =
           spec.format === resolvedFormat && spec.quality === resolvedQuality;
-        const estimatedBytes =
-          spec.format === 'video' && spec.quality === '720'
-            ? base720Bytes
-            : spec.format === 'audio' && durationSec > 0
-            ? Math.min(
-                Math.round(base720Bytes * (qualityMultipliers[spec.quality] || 0.2)),
-                Math.round(
-                  durationSec *
-                    (spec.quality === '320' ? 32000 : spec.quality === '192' ? 20000 : 14000)
-                )
-              )
-            : Math.round(base720Bytes * (qualityMultipliers[spec.quality] || 0.5));
+
+        const ytEntry = ytMulti
+          ? spec.format === 'audio'
+            ? ytMulti.audioStreams[spec.quality]
+            : ytMulti.videoStreams[spec.quality]
+          : undefined;
+
+        const exactBytes = ytEntry
+          ? ytEntry.sizeBytes
+          : hasFfmpeg
+          ? Math.round(base720Bytes * (qualityMultipliers[spec.quality] || 0.5))
+          : base720Bytes;
+
+        const mediaBytes = computeMediaCompressed(exactBytes);
+        const zipBytes = computeZipCompressed(exactBytes);
+        const streamSourceUrl = ytEntry?.url || resolved.resolvedUrl;
+
         const savedPct =
-          max1080Bytes > 0 && estimatedBytes < max1080Bytes
-            ? Math.max(0, Math.min(96, Math.round(((max1080Bytes - estimatedBytes) / max1080Bytes) * 100)))
+          max1080Bytes > 0 && exactBytes < max1080Bytes
+            ? Math.max(0, Math.min(96, Math.round(((max1080Bytes - exactBytes) / max1080Bytes) * 100)))
             : 0;
         const fmtFileName =
           spec.format === 'audio'
             ? `${baseTitle} (${spec.quality}kbps).mp3`
             : `${baseTitle} (${spec.quality}p).mp4`;
-        // Use the already-probed compact stream directly for all qualities <= 720p so SaveTube never inflates lower qualities
-        const useFastBaseStream = spec.quality !== '1080';
 
         availableFormats.push({
           id: spec.id,
@@ -6713,32 +7032,45 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
           label: spec.label,
           badge: spec.badge,
           ext: spec.ext,
-          sizeBytes: estimatedBytes,
+          sizeBytes: exactBytes,
+          mediaCompressedBytes: mediaBytes,
+          zipCompressedBytes: zipBytes,
           savedPercent: savedPct,
           isSelected: isSelectedSpec,
           fileName: fmtFileName,
           zipFileName: `${fmtFileName}.zip`,
+          sourceStreamUrl: streamSourceUrl,
           downloadUrl: makeProxyUrl({
             fmt: spec.format,
             q: spec.quality,
             comp: 'none',
             fName: fmtFileName,
-            useDirectResolved: useFastBaseStream,
-            targetBytes: estimatedBytes,
+            streamSourceUrl,
+            targetBytes: exactBytes,
+          }),
+          mediaDownloadUrl: makeProxyUrl({
+            fmt: spec.format,
+            q: spec.quality,
+            comp: 'media',
+            fName: fmtFileName,
+            streamSourceUrl,
+            targetBytes: mediaBytes,
           }),
           zipDownloadUrl: makeProxyUrl({
             fmt: spec.format,
             q: spec.quality,
             comp: 'zip',
             fName: fmtFileName,
-            useDirectResolved: useFastBaseStream,
-            targetBytes: estimatedBytes,
+            streamSourceUrl,
+            targetBytes: zipBytes,
           }),
         });
       }
     } else {
       const extMatch = fileName.match(/\.([^.]+)$/);
       const ext = extMatch ? extMatch[1].toLowerCase() : 'bin';
+      const mediaBytes = computeMediaCompressed(totalBytes);
+      const zipBytes = computeZipCompressed(totalBytes);
       availableFormats.push({
         id: 'direct_original',
         format: resolvedFormat,
@@ -6747,35 +7079,49 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
         badge: 'بدون ضغط',
         ext,
         sizeBytes: totalBytes,
+        mediaCompressedBytes: mediaBytes,
+        zipCompressedBytes: zipBytes,
         savedPercent: 0,
-        isSelected: resolvedCompress === 'none',
+        isSelected: true,
         fileName,
         zipFileName: `${fileName}.zip`,
+        sourceStreamUrl: resolved.resolvedUrl,
         downloadUrl: makeProxyUrl({
           fmt: resolvedFormat,
           q: resolvedQuality,
           comp: 'none',
           fName: fileName,
-          useDirectResolved: true,
+          streamSourceUrl: resolved.resolvedUrl,
           targetBytes: totalBytes,
+        }),
+        mediaDownloadUrl: makeProxyUrl({
+          fmt: resolvedFormat,
+          q: resolvedQuality,
+          comp: 'media',
+          fName: fileName,
+          streamSourceUrl: resolved.resolvedUrl,
+          targetBytes: mediaBytes,
         }),
         zipDownloadUrl: makeProxyUrl({
           fmt: resolvedFormat,
           q: resolvedQuality,
           comp: 'zip',
           fName: fileName,
-          useDirectResolved: true,
-          targetBytes: totalBytes,
+          streamSourceUrl: resolved.resolvedUrl,
+          targetBytes: zipBytes,
         }),
       });
     }
 
+    const activeSpec =
+      availableFormats.find((f) => f.isSelected) || availableFormats[1] || availableFormats[0];
+    const activeBaseBytes = activeSpec ? activeSpec.sizeBytes : totalBytes || base720Bytes;
     const activeCompressedBytes =
       resolvedCompress === 'zip'
-        ? Math.round((totalBytes || base720Bytes) * 0.92)
+        ? activeSpec?.zipCompressedBytes || computeZipCompressed(activeBaseBytes)
         : resolvedCompress === 'media'
-        ? Math.round((totalBytes || base720Bytes) * 0.65)
-        : totalBytes || base720Bytes;
+        ? activeSpec?.mediaCompressedBytes || computeMediaCompressed(activeBaseBytes)
+        : activeBaseBytes;
     const savedBytes = Math.max(0, originalBaselineBytes - activeCompressedBytes);
     const savedPercent =
       originalBaselineBytes > 0
@@ -6787,7 +7133,7 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
       q: resolvedQuality,
       comp: resolvedCompress,
       fName: fileName,
-      useDirectResolved: true,
+      streamSourceUrl: activeSpec?.sourceStreamUrl || resolved.resolvedUrl,
       targetBytes: activeCompressedBytes,
     });
 
@@ -6799,14 +7145,14 @@ app.post('/api/transfers/resolve-direct', async (req, res) => {
       durationSec,
       fileName: downloadFileName,
       mimeType: resolvedCompress === 'zip' ? 'application/zip' : mimeType,
-      totalBytes,
+      totalBytes: activeBaseBytes,
       originalSizeBytes: originalBaselineBytes,
       compressedSizeBytes: activeCompressedBytes,
       savedBytes,
       savedPercent,
       compressMode: resolvedCompress,
       effectiveQuality: resolvedQuality,
-      directStreamUrl: resolved.resolvedUrl,
+      directStreamUrl: activeSpec?.sourceStreamUrl || resolved.resolvedUrl,
       proxyDownloadUrl,
       availableFormats,
     });
@@ -6910,13 +7256,8 @@ app.get(['/api/direct-download', '/api/direct-download/:pathFileName'], async (r
         signal,
       });
     } else if (targetUrl || sourceUrlParam) {
-      // If we already have a verified compact stream URL (sourceUrlParam) and quality !== '1080',
-      // fetch it directly so SaveTube never re-encodes 240p/360p/480p into a larger file.
-      const useFastSourceDirect = Boolean(
-        sourceUrlParam && /^https?:\/\//i.test(sourceUrlParam) && qualityParam !== '1080'
-      );
-
-      if (useFastSourceDirect) {
+      // Try the specific quality's verified sourceUrlParam first
+      if (sourceUrlParam && /^https?:\/\//i.test(sourceUrlParam)) {
         upstreamRes = await fetch(sourceUrlParam, {
           signal,
           headers: {
@@ -6993,16 +7334,18 @@ app.get(['/api/direct-download', '/api/direct-download/:pathFileName'], async (r
     res.setHeader('X-Compression-Mode', compressParam);
 
     const hasFfmpeg = await isFfmpegAvailable();
-    const cleanQ = qualityParam.replace(/[^0-9]/g, '');
-    const needsLocalMediaProcess =
-      hasFfmpeg &&
-      (compressParam === 'media' ||
-        formatParam === 'audio' ||
-        ['240', '360', '480'].includes(cleanQ) ||
-        (targetBytesParam > 0 && (upstreamLenNum === 0 || upstreamLenNum > targetBytesParam * 1.02)));
+    const upstreamExceedsTarget =
+      targetBytesParam > 0 && (upstreamLenNum === 0 || upstreamLenNum > targetBytesParam * 1.005);
 
-    // Unified Local Processing Pipeline: handles exact resolution & targetBytes transcoding + optional ZIP
-    if (needsLocalMediaProcess) {
+    const needsLocalProcess =
+      compressParam === 'zip' ||
+      (hasFfmpeg &&
+        (compressParam === 'media' ||
+          (formatParam === 'audio' && !mimeType.startsWith('audio/mpeg')) ||
+          upstreamExceedsTarget));
+
+    // Unified Local Processing Pipeline: guarantees exact Content-Length & stat.size <= targetBytesParam
+    if (needsLocalProcess) {
       const safeName = fileName.replace(/[^a-zA-Z0-9._\u0600-\u06FF-]/g, '_');
       const rawTemp = path.join('/tmp', `dl_raw_${Date.now()}_${safeName}`);
       tempFilesToClean.push(rawTemp);
@@ -7048,27 +7391,7 @@ app.get(['/api/direct-download', '/api/direct-download/:pathFileName'], async (r
       return;
     }
 
-    // Fast On-the-Fly Streaming ZIP Compression when no FFmpeg transcoding is required
-    if (compressParam === 'zip') {
-      const zipDownloadName = fileName.toLowerCase().endsWith('.zip') ? fileName : `${fileName}.zip`;
-      const asciiZipFallback = zipDownloadName.replace(/[^\x20-\x7E]/g, '_') || 'download.zip';
-      res.setHeader('Content-Type', 'application/zip');
-      res.setHeader(
-        'Content-Disposition',
-        `attachment; filename="${asciiZipFallback}"; filename*=UTF-8''${encodeURIComponent(zipDownloadName)}`
-      );
-
-      await pipeStreamToZipWritable(
-        readableStreamToAsyncIterable(upstreamRes.body),
-        res,
-        fileName,
-        signal
-      );
-      res.end();
-      return;
-    }
-
-    // Direct zero-copy stream to user's browser (when stream already matches requested size)
+    // Direct zero-copy stream to user's browser (when stream already matches requested size <= targetBytesParam)
     const asciiFallback = fileName.replace(/[^\x20-\x7E]/g, '_') || 'download';
     res.setHeader('Content-Type', mimeType || 'application/octet-stream');
     const contentEnc = upstreamRes.headers.get('content-encoding');

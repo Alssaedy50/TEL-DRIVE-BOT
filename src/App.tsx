@@ -114,11 +114,15 @@ interface AvailableMediaFormat {
   badge: string;
   ext: string;
   sizeBytes: number;
+  mediaCompressedBytes?: number;
+  zipCompressedBytes?: number;
   savedPercent: number;
   isSelected: boolean;
   fileName: string;
   zipFileName: string;
+  sourceStreamUrl?: string;
   downloadUrl: string;
+  mediaDownloadUrl?: string;
   zipDownloadUrl: string;
 }
 
@@ -1190,11 +1194,21 @@ export default function App() {
   };
 
   const getEffectiveFormatBytes = useCallback(
-    (baseBytes: number, mode: CompressMode = externalCompressMode) => {
-      if (!baseBytes || baseBytes <= 0) return 0;
-      if (mode === 'zip') return Math.max(64 * 1024, Math.round(baseBytes * 0.92));
-      if (mode === 'media') return Math.max(64 * 1024, Math.round(baseBytes * 0.65));
-      return baseBytes;
+    (fmtOrBytes: AvailableMediaFormat | number | null | undefined, mode: CompressMode = externalCompressMode) => {
+      if (!fmtOrBytes) return 0;
+      if (typeof fmtOrBytes === 'object') {
+        if (mode === 'zip') {
+          return fmtOrBytes.zipCompressedBytes || Math.max(32 * 1024, Math.round(fmtOrBytes.sizeBytes * 0.85));
+        }
+        if (mode === 'media') {
+          return fmtOrBytes.mediaCompressedBytes || Math.max(32 * 1024, Math.round(fmtOrBytes.sizeBytes * 0.65));
+        }
+        return fmtOrBytes.sizeBytes;
+      }
+      if (fmtOrBytes <= 0) return 0;
+      if (mode === 'zip') return Math.max(32 * 1024, Math.round(fmtOrBytes * 0.85));
+      if (mode === 'media') return Math.max(32 * 1024, Math.round(fmtOrBytes * 0.65));
+      return fmtOrBytes;
     },
     [externalCompressMode]
   );
@@ -1206,13 +1220,9 @@ export default function App() {
       rawCustomName: string,
       baselineOriginalBytes: number
     ) => {
-      const effectiveBytes = getEffectiveFormatBytes(fmt.sizeBytes, mode);
+      const effectiveBytes = getEffectiveFormatBytes(fmt, mode);
       const isZip = mode === 'zip';
-      const effectiveCompress: CompressMode = isZip
-        ? 'zip'
-        : mode === 'media' || fmt.savedPercent > 0
-          ? 'media'
-          : 'none';
+      const effectiveCompress: CompressMode = mode;
 
       const cleanCustom =
         rawCustomName.trim() &&
@@ -1225,9 +1235,16 @@ export default function App() {
         ? `${cleanCustom}.${isZip ? `${fmt.ext}.zip` : fmt.ext}`
         : isZip
           ? fmt.zipFileName
-          : fmt.fileName;
+          : mode === 'media' && !fmt.fileName.includes('(مضغوط)')
+            ? fmt.fileName.replace(/(\.[^/.]+)$/, ' (مضغوط)$1')
+            : fmt.fileName;
 
-      const baseUrl = isZip ? fmt.zipDownloadUrl : fmt.downloadUrl;
+      const baseUrl =
+        mode === 'zip'
+          ? fmt.zipDownloadUrl
+          : mode === 'media'
+            ? fmt.mediaDownloadUrl || fmt.downloadUrl
+            : fmt.downloadUrl;
       let finalUrl = baseUrl;
       try {
         const parsed = new URL(baseUrl, window.location.origin);
@@ -1338,7 +1355,7 @@ export default function App() {
           (f) => f.format === externalMediaFormat && f.quality === externalQuality
         ) || resolvedMediaInfo?.availableFormats?.find((f) => f.format === externalMediaFormat);
       const targetBytesForJob = matchedFmt
-        ? getEffectiveFormatBytes(matchedFmt.sizeBytes, externalCompressMode)
+        ? getEffectiveFormatBytes(matchedFmt, externalCompressMode)
         : undefined;
 
       const res = await fetch('/api/transfers/url', {
@@ -1622,7 +1639,7 @@ export default function App() {
   ) || resolvedMediaInfo?.availableFormats?.find((f) => f.format === externalMediaFormat);
 
   const selectedEffectiveBytes = selectedResolvedFormatObj
-    ? getEffectiveFormatBytes(selectedResolvedFormatObj.sizeBytes, externalCompressMode)
+    ? getEffectiveFormatBytes(selectedResolvedFormatObj, externalCompressMode)
     : getEffectiveFormatBytes(
         resolvedMediaInfo?.compressedSizeBytes || resolvedMediaInfo?.sizeBytes || 0,
         externalCompressMode
@@ -1988,7 +2005,7 @@ export default function App() {
                         const isChosen =
                           externalMediaFormat === fmt.format &&
                           (externalQuality === fmt.quality || fmt.quality === 'original');
-                        const displayBytes = getEffectiveFormatBytes(fmt.sizeBytes, externalCompressMode);
+                        const displayBytes = getEffectiveFormatBytes(fmt, externalCompressMode);
                         const baseOriginal = resolvedMediaInfo.originalSizeBytes || fmt.sizeBytes;
                         const dynamicSavedPct =
                           baseOriginal > 0 && displayBytes > 0 && displayBytes < baseOriginal
