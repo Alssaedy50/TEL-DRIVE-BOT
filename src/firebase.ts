@@ -15,6 +15,8 @@ export const auth = getAuth(app);
 
 export const SCOPES = [
   'https://www.googleapis.com/auth/drive.file',
+  'https://www.googleapis.com/auth/userinfo.email',
+  'https://www.googleapis.com/auth/userinfo.profile',
 ];
 
 const TOKEN_STORAGE_KEY = 'tg_drive_oauth_token';
@@ -26,7 +28,7 @@ for (const scope of SCOPES) {
   provider.addScope(scope);
 }
 provider.setCustomParameters({
-  prompt: 'select_account consent',
+  prompt: 'select_account',
 });
 
 let isSigningIn = false;

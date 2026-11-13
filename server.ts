@@ -286,13 +286,26 @@ function getOrCreateUserProfile(opts: {
   const cleanEmail = opts.email ? opts.email.trim().toLowerCase() : '';
   const chatId = opts.chatId && !isNaN(Number(opts.chatId)) ? Number(opts.chatId) : null;
 
-  // 1. Lookup by email
-  if (cleanEmail && userProfiles[cleanEmail]) {
-    const prof = userProfiles[cleanEmail];
-    if (chatId && !prof.chatId) {
-      prof.chatId = chatId;
+  // 1. Lookup by email (case-insensitive)
+  const existingByEmail =
+    (cleanEmail && (userProfiles[cleanEmail] || (opts.email ? userProfiles[opts.email.trim()] : undefined))) ||
+    (cleanEmail
+      ? Object.values(userProfiles).find((p) => p.userEmail && p.userEmail.trim().toLowerCase() === cleanEmail)
+      : undefined);
+
+  if (existingByEmail) {
+    if (cleanEmail && !userProfiles[cleanEmail]) {
+      userProfiles[cleanEmail] = existingByEmail;
     }
-    return prof;
+    if (chatId) {
+      for (const other of Object.values(userProfiles)) {
+        if (other !== existingByEmail && other.chatId === chatId) {
+          other.chatId = null;
+        }
+      }
+      existingByEmail.chatId = chatId;
+    }
+    return existingByEmail;
   }
 
   // 2. Lookup by chatId across all profiles
@@ -305,12 +318,17 @@ function getOrCreateUserProfile(opts: {
         byChat.profileId = cleanEmail;
         byChat.userEmail = opts.email!.trim();
         userProfiles[cleanEmail] = byChat;
+        return byChat;
       }
-      return byChat;
+      if (!cleanEmail || (byChat.userEmail && byChat.userEmail.trim().toLowerCase() === cleanEmail)) {
+        return byChat;
+      }
+      // User switched to a new Google email on the same chatId: detach old profile's chatId so new email gets its own profile
+      byChat.chatId = null;
     }
 
-    // If ownerChatId matches legacy driveSession
-    if (chatId === adminConfig.ownerChatId && driveSession.userEmail) {
+    // If ownerChatId matches legacy driveSession and no conflicting email was specified
+    if (!cleanEmail && chatId === adminConfig.ownerChatId && driveSession.userEmail) {
       const ownerKey = driveSession.userEmail.trim().toLowerCase();
       if (userProfiles[ownerKey]) {
         userProfiles[ownerKey].chatId = chatId;
@@ -2402,6 +2420,30 @@ async function resolveTelegramPostLinkIfApplicable(
 
     // 0A. YouTube Links (watch, shorts, youtu.be, live, music.youtube.com)
     if (host.includes('youtube.com') || host === 'youtu.be' || host.endsWith('.youtu.be')) {
+      try {
+        const ytStreams = await resolveYouTubeAllStreams(cleanedInputUrl);
+        const chosen =
+          mediaFormat === 'audio'
+            ? ytStreams.audioStreams[effectiveQuality] ||
+              ytStreams.audioStreams['320'] ||
+              Object.values(ytStreams.audioStreams)[0]
+            : ytStreams.videoStreams[effectiveQuality] ||
+              ytStreams.videoStreams['720'] ||
+              Object.values(ytStreams.videoStreams)[0];
+        if (chosen && chosen.url) {
+          const ext = mediaFormat === 'audio' ? 'mp3' : 'mp4';
+          return {
+            resolvedUrl: chosen.url,
+            detectedFileName: `${ytStreams.safeTitle}${mediaFormat === 'audio' ? '' : ` (${chosen.quality}p)`}.${ext}`,
+            detectedMimeType: mediaFormat === 'audio' ? 'audio/mpeg' : chosen.mimeType || 'video/mp4',
+            rawTitle: ytStreams.safeTitle,
+            durationSec: ytStreams.durationSec,
+            customHeaders: ytStreams.customHeaders,
+          };
+        }
+      } catch {
+        // Fallback to single stream resolver
+      }
       return await resolveYouTubeStream(cleanedInputUrl, mediaFormat, effectiveQuality);
     }
 
@@ -3668,22 +3710,28 @@ function resolveJobDriveSession(job: TransferJob): {
   defaultCompressMode: CompressMode;
   profile: UserDriveProfile;
 } {
-  if (job.accountEmail && job.accountEmail !== 'default' && userProfiles[job.accountEmail]) {
-    const prof = userProfiles[job.accountEmail];
-    return {
-      accessToken: prof.accessToken,
-      userEmail: prof.userEmail,
-      userName: prof.userName,
-      activeFolderId: prof.activeFolderId,
-      activeFolderName: prof.activeFolderName || 'Telegram Bot Uploads',
-      accountEnabled: prof.accountEnabled,
-      autoCategorizeByType: prof.autoCategorizeByType,
-      skipDuplicates: prof.skipDuplicates,
-      urlHandlingMode: prof.urlHandlingMode,
-      defaultQuality: prof.defaultQuality || '720',
-      defaultCompressMode: prof.defaultCompressMode || 'none',
-      profile: prof,
-    };
+  if (job.accountEmail && job.accountEmail !== 'default') {
+    const emailKey = job.accountEmail.trim().toLowerCase();
+    const prof =
+      userProfiles[emailKey] ||
+      userProfiles[job.accountEmail] ||
+      Object.values(userProfiles).find((p) => p.userEmail && p.userEmail.trim().toLowerCase() === emailKey);
+    if (prof) {
+      return {
+        accessToken: prof.accessToken,
+        userEmail: prof.userEmail,
+        userName: prof.userName,
+        activeFolderId: prof.activeFolderId,
+        activeFolderName: prof.activeFolderName || 'Telegram Bot Uploads',
+        accountEnabled: prof.accountEnabled,
+        autoCategorizeByType: prof.autoCategorizeByType,
+        skipDuplicates: prof.skipDuplicates,
+        urlHandlingMode: prof.urlHandlingMode,
+        defaultQuality: prof.defaultQuality || '720',
+        defaultCompressMode: prof.defaultCompressMode || 'none',
+        profile: prof,
+      };
+    }
   }
   return getEffectiveSessionForChat(job.chatId);
 }
@@ -3807,7 +3855,10 @@ async function executeTransferJob(job: TransferJob): Promise<void> {
 
     if (job.source === 'telegram' && job.telegramFileId) {
       const isOverStandardLimit = job.totalBytes > 19.5 * 1024 * 1024;
-      let useMtproto = isOverStandardLimit && mtprotoConnected;
+      if (isOverStandardLimit && (!mtprotoConnected || !mtprotoClient)) {
+        await startMtprotoEngine();
+      }
+      let useMtproto = isOverStandardLimit && mtprotoConnected && Boolean(mtprotoClient);
       let downloadUrl = '';
 
       if (!useMtproto) {
@@ -3829,6 +3880,9 @@ async function executeTransferJob(job: TransferJob): Promise<void> {
           if (signal.aborted) throw new Error('CANCELLED_BY_USER');
           const msg = err?.message || '';
           if (msg.toLowerCase().includes('file is too big')) {
+            if (!mtprotoConnected || !mtprotoClient) {
+              await startMtprotoEngine();
+            }
             if (mtprotoConnected && mtprotoClient) {
               useMtproto = true;
             } else {
@@ -3959,12 +4013,8 @@ async function executeTransferJob(job: TransferJob): Promise<void> {
       throw new Error('لا يوجد مصدر صالح لتحميل الملف.');
     }
 
-    // Optional Transcoding / Size-Target Enforcement / Compression Step Before Uploading to Google Drive
-    const needsDriveMediaProcess =
-      effectiveCompressMode !== 'none' ||
-      job.mediaFormat === 'audio' ||
-      (job.quality && ['240', '360', '480'].includes(job.quality)) ||
-      Boolean(job.targetBytes && job.targetBytes > 0);
+    // Optional Compression Step Before Uploading to Google Drive (only when explicitly requested)
+    const needsDriveMediaProcess = effectiveCompressMode !== 'none';
 
     if (needsDriveMediaProcess) {
       resumeOffset = 0;
@@ -4165,6 +4215,71 @@ async function listDriveFilesForTelegram(
   return data.files || [];
 }
 
+async function resolveMtprotoPeerForChat(
+  client: TelegramClient,
+  chatId: number,
+  hintMessageId?: number
+): Promise<any> {
+  try {
+    return await client.getInputEntity(chatId);
+  } catch {
+    // Fallback 1: Try known username if available
+    const known = adminConfig.knownUsers[String(chatId)];
+    if (known?.username) {
+      try {
+        return await client.getInputEntity(known.username.startsWith('@') ? known.username : `@${known.username}`);
+      } catch {
+        // Continue to message lookup
+      }
+    }
+    // Fallback 2: Fetch a message from this chat via Bot MTProto to prime the entity cache & extract accessHash
+    const msgIdsToTry: number[] = [];
+    if (hintMessageId && hintMessageId > 0) msgIdsToTry.push(hintMessageId);
+    for (const j of transferJobs) {
+      if (j.chatId === chatId) {
+        if (j.statusMessageId && !msgIdsToTry.includes(j.statusMessageId)) msgIdsToTry.push(j.statusMessageId);
+        if (j.messageId && !msgIdsToTry.includes(j.messageId)) msgIdsToTry.push(j.messageId);
+      }
+      if (msgIdsToTry.length >= 5) break;
+    }
+
+    if (msgIdsToTry.length > 0) {
+      try {
+        const res = await client.invoke(
+          new Api.messages.GetMessages({
+            id: msgIdsToTry.map((id) => new Api.InputMessageID({ id })),
+          })
+        );
+        if ('users' in res && Array.isArray(res.users)) {
+          for (const u of res.users) {
+            if (u instanceof Api.User && String(u.id) === String(chatId) && u.accessHash) {
+              return new Api.InputPeerUser({
+                userId: u.id,
+                accessHash: u.accessHash,
+              });
+            }
+          }
+        }
+        if ('chats' in res && Array.isArray(res.chats) && res.chats.length > 0) {
+          const c = res.chats[0];
+          if (c instanceof Api.Channel && c.accessHash) {
+            return new Api.InputPeerChannel({
+              channelId: c.id,
+              accessHash: c.accessHash,
+            });
+          }
+          if (c instanceof Api.Chat) {
+            return new Api.InputPeerChat({ chatId: c.id });
+          }
+        }
+      } catch (err: any) {
+        console.warn('MTProto GetMessages peer resolution warning:', err?.message);
+      }
+    }
+    return chatId;
+  }
+}
+
 async function sendLocalFileToTelegramChat(
   chatId: number,
   tempFilePath: string,
@@ -4172,15 +4287,16 @@ async function sendLocalFileToTelegramChat(
   fileSize: number,
   caption: string,
   signal: AbortSignal,
-  onUploadProgress?: (pct: number) => void
+  onUploadProgress?: (pct: number) => void,
+  hintMessageId?: number
 ): Promise<void> {
   const token = getBotToken();
   if (!token) {
     throw new Error('TELEGRAM_BOT_TOKEN غير متوفر.');
   }
 
-  // Use standard Bot API sendVideo / sendAudio / sendDocument for files <= 45 MB (fast & zero overhead)
-  const MAX_BOT_API_SEND = 45 * 1024 * 1024;
+  // Use standard Bot API sendVideo / sendAudio / sendDocument for files <= 49 MB (fast & zero overhead)
+  const MAX_BOT_API_SEND = 49 * 1024 * 1024;
   if (fileSize <= MAX_BOT_API_SEND && typeof fs.openAsBlob === 'function') {
     try {
       const blob = await fs.openAsBlob(tempFilePath);
@@ -4212,7 +4328,27 @@ async function sendLocalFileToTelegramChat(
       });
       const data = await res.json();
       if (data.ok) {
+        if (onUploadProgress) onUploadProgress(100);
         return;
+      }
+
+      // If sendVideo/sendAudio failed due to codec/container metadata, retry immediately as sendDocument
+      if (endpoint !== 'sendDocument') {
+        const docForm = new FormData();
+        docForm.append('chat_id', String(chatId));
+        docForm.append('caption', caption);
+        docForm.append('parse_mode', 'HTML');
+        docForm.append('document', blob, fileName);
+        const docRes = await fetch(`${getTelegramApiRoot()}/bot${token}/sendDocument`, {
+          method: 'POST',
+          body: docForm,
+          signal,
+        });
+        const docData = await docRes.json();
+        if (docData.ok) {
+          if (onUploadProgress) onUploadProgress(100);
+          return;
+        }
       }
       console.warn(`Bot API ${endpoint} fallback to MTProto:`, data.description);
     } catch (err: any) {
@@ -4237,12 +4373,13 @@ async function sendLocalFileToTelegramChat(
     await mtprotoClient.connect();
   }
 
+  const targetPeer = await resolveMtprotoPeerForChat(mtprotoClient, chatId, hintMessageId);
   const customFile = new CustomFile(fileName, fileSize, tempFilePath);
-  await mtprotoClient.sendFile(chatId, {
+  await mtprotoClient.sendFile(targetPeer, {
     file: customFile,
     caption,
     forceDocument: !fileName.toLowerCase().endsWith('.mp4'),
-    workers: 8,
+    workers: 4,
     progressCallback: (progress: number) => {
       if (signal.aborted) {
         throw new Error('CANCELLED_BY_USER');
@@ -4420,11 +4557,7 @@ async function executePullToTelegramJob(job: TransferJob): Promise<void> {
     );
 
     let finalTempPath = rawTempFilePath;
-    const needsTgMediaProcess =
-      effectiveCompressMode !== 'none' ||
-      job.mediaFormat === 'audio' ||
-      (job.quality && ['240', '360', '480'].includes(job.quality)) ||
-      Boolean(job.targetBytes && job.targetBytes > 0);
+    const needsTgMediaProcess = effectiveCompressMode !== 'none';
 
     if (needsTgMediaProcess) {
       if (job.chatId && job.statusMessageId) {
@@ -4506,7 +4639,8 @@ async function executePullToTelegramJob(job: TransferJob): Promise<void> {
             cancelKeyboard
           );
         }
-      }
+      },
+      job.statusMessageId || job.messageId
     );
 
     jobAbortControllers.delete(job.id);
@@ -5116,7 +5250,11 @@ async function handleCallbackQuery(callbackQuery: any): Promise<void> {
 
     transferJobs.unshift(job);
     saveStateToDisk();
-    executePullToTelegramJob(job);
+    if (IS_VERCEL) {
+      await executePullToTelegramJob(job);
+    } else {
+      executePullToTelegramJob(job);
+    }
     return;
   }
 
@@ -6203,6 +6341,7 @@ function resolveRequestUserContext(req: express.Request): {
     (req.body && typeof req.body.userEmail === 'string' && req.body.userEmail) ||
     '';
   const cleanEmail = rawEmail.trim() || null;
+  const emailKey = cleanEmail ? cleanEmail.toLowerCase() : null;
 
   const rawChatId =
     (typeof req.query.chatId === 'string' && req.query.chatId) ||
@@ -6212,28 +6351,33 @@ function resolveRequestUserContext(req: express.Request): {
   const parsedChatId = Number(rawChatId);
   const validChatId = !isNaN(parsedChatId) && parsedChatId !== 0 ? parsedChatId : null;
 
-  if (cleanEmail && userProfiles[cleanEmail]) {
-    const prof = userProfiles[cleanEmail];
-    if (validChatId && !prof.chatId) {
-      prof.chatId = validChatId;
+  const matchedProf = emailKey
+    ? userProfiles[emailKey] ||
+      (cleanEmail ? userProfiles[cleanEmail] : undefined) ||
+      Object.values(userProfiles).find((p) => p.userEmail && p.userEmail.trim().toLowerCase() === emailKey)
+    : undefined;
+
+  if (matchedProf) {
+    if (validChatId && !matchedProf.chatId) {
+      matchedProf.chatId = validChatId;
     }
     return {
-      userEmail: prof.userEmail,
-      chatId: prof.chatId || validChatId,
-      profile: prof,
+      userEmail: matchedProf.userEmail,
+      chatId: matchedProf.chatId || validChatId,
+      profile: matchedProf,
       session: {
-        accessToken: prof.accessToken,
-        userEmail: prof.userEmail,
-        userName: prof.userName,
-        activeFolderId: prof.activeFolderId,
-        activeFolderName: prof.activeFolderName || 'Telegram Bot Uploads',
-        accountEnabled: prof.accountEnabled,
-        autoCategorizeByType: prof.autoCategorizeByType,
-        skipDuplicates: prof.skipDuplicates,
-        urlHandlingMode: prof.urlHandlingMode,
-        defaultQuality: prof.defaultQuality || '720',
-        defaultCompressMode: prof.defaultCompressMode || 'none',
-        profile: prof,
+        accessToken: matchedProf.accessToken,
+        userEmail: matchedProf.userEmail,
+        userName: matchedProf.userName,
+        activeFolderId: matchedProf.activeFolderId,
+        activeFolderName: matchedProf.activeFolderName || 'Telegram Bot Uploads',
+        accountEnabled: matchedProf.accountEnabled,
+        autoCategorizeByType: matchedProf.autoCategorizeByType,
+        skipDuplicates: matchedProf.skipDuplicates,
+        urlHandlingMode: matchedProf.urlHandlingMode,
+        defaultQuality: matchedProf.defaultQuality || '720',
+        defaultCompressMode: matchedProf.defaultCompressMode || 'none',
+        profile: matchedProf,
       },
     };
   }
@@ -6474,14 +6618,58 @@ app.post('/api/drive/sync', async (req, res) => {
 
   const parsedChatId = Number(chatId);
   const validChatId = !isNaN(parsedChatId) && parsedChatId !== 0 ? parsedChatId : undefined;
-  const cleanEmail = typeof userEmail === 'string' && userEmail.trim() ? userEmail.trim() : undefined;
+  let cleanEmail = typeof userEmail === 'string' && userEmail.trim() ? userEmail.trim() : undefined;
+  let resolvedUserName = typeof userName === 'string' && userName.trim() ? userName.trim() : undefined;
+
+  // Automatically discover user's email & displayName from Google Drive / OAuth2 API if not provided by client
+  if (!cleanEmail) {
+    try {
+      const aboutRes = await fetch(
+        'https://www.googleapis.com/drive/v3/about?fields=user(displayName,emailAddress)',
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      if (aboutRes.ok) {
+        const aboutData = await aboutRes.json();
+        if (aboutData?.user?.emailAddress) {
+          cleanEmail = String(aboutData.user.emailAddress).trim();
+        }
+        if (!resolvedUserName && aboutData?.user?.displayName) {
+          resolvedUserName = String(aboutData.user.displayName).trim();
+        }
+      }
+    } catch {
+      // Continue to oauth2 userinfo fallback
+    }
+  }
+  if (!cleanEmail) {
+    try {
+      const infoRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (infoRes.ok) {
+        const infoData = await infoRes.json();
+        if (infoData?.email) {
+          cleanEmail = String(infoData.email).trim();
+        }
+        if (!resolvedUserName && infoData?.name) {
+          resolvedUserName = String(infoData.name).trim();
+        }
+      }
+    } catch {
+      // Ignore userinfo fallback error
+    }
+  }
 
   const prof = getOrCreateUserProfile({ email: cleanEmail, chatId: validChatId });
-  const wasUnlinkedOrDifferentEmail = !prof.accessToken || (cleanEmail && prof.userEmail !== cleanEmail);
+  const wasUnlinkedOrDifferentEmail =
+    !prof.accessToken ||
+    (cleanEmail && (!prof.userEmail || prof.userEmail.toLowerCase() !== cleanEmail.toLowerCase()));
 
   prof.accessToken = token;
   if (cleanEmail) prof.userEmail = cleanEmail;
-  if (userName !== undefined) prof.userName = userName;
+  if (resolvedUserName !== undefined) prof.userName = resolvedUserName;
   if (validChatId) {
     prof.chatId = validChatId;
     const known = adminConfig.knownUsers[String(validChatId)];
@@ -6504,9 +6692,12 @@ app.post('/api/drive/sync', async (req, res) => {
   }
   prof.lastSyncedAt = new Date().toISOString();
 
-  // Re-key profile under email if it was previously keyed under tg_<chatId>
-  if (cleanEmail && !userProfiles[cleanEmail]) {
-    userProfiles[cleanEmail] = prof;
+  // Re-key profile under lowercase email key so any user email works consistently
+  if (cleanEmail) {
+    const emailKey = cleanEmail.toLowerCase();
+    if (!userProfiles[emailKey]) {
+      userProfiles[emailKey] = prof;
+    }
   }
 
   try {
@@ -6515,12 +6706,22 @@ app.post('/api/drive/sync', async (req, res) => {
       prof.activeFolderName = folderName;
     } else {
       const targetName = folderName || prof.activeFolderName || 'Telegram Bot Uploads';
-      const folder = await ensureDriveFolder(token, targetName);
-      prof.activeFolderId = folder.id;
-      prof.activeFolderName = folder.name;
+      try {
+        const folder = await ensureDriveFolder(token, targetName);
+        prof.activeFolderId = folder.id;
+        prof.activeFolderName = folder.name;
+      } catch (folderErr: any) {
+        const errMsg = folderErr?.message || '';
+        if (errMsg.includes('انتهت صلاحية') || errMsg.includes('401')) {
+          throw folderErr;
+        }
+        // Fallback to root Drive if folder creation is restricted on custom workspace policy
+        prof.activeFolderId = 'root';
+        prof.activeFolderName = 'My Drive (الرئيسي)';
+      }
     }
 
-    // Update legacy owner globals if this user is the owner or no owner is set yet
+    // Update legacy owner globals if this user is the owner or no active owner token is set yet
     if (!adminConfig.ownerChatId || !driveSession.accessToken || prof.chatId === adminConfig.ownerChatId) {
       driveSession.accessToken = prof.accessToken;
       driveSession.userEmail = prof.userEmail;
@@ -8116,8 +8317,10 @@ app.post('/api/transfers/url', async (req, res) => {
     typeof sourceUrl === 'string' && /^https?:\/\//i.test(sourceUrl.trim()) ? sourceUrl.trim() : '';
 
   try {
-    // Validate and resolve URL upfront to provide immediate feedback for unsupported link types (e.g. Telegram post links)
-    const resolvedMedia = await resolveTelegramPostLinkIfApplicable(cleanUrl, resolvedFormat, resolvedQuality);
+    // Validate and resolve URL upfront (or use pre-probed sourceUrl directly if provided)
+    const resolvedMedia = cleanSourceUrl
+      ? { resolvedUrl: cleanSourceUrl, detectedFileName: undefined }
+      : await resolveTelegramPostLinkIfApplicable(cleanUrl, resolvedFormat, resolvedQuality);
     const fileName =
       (customFileName || '').trim() ||
       resolvedMedia.detectedFileName ||
@@ -8185,9 +8388,13 @@ app.post('/api/transfers/url', async (req, res) => {
 
       transferJobs.unshift(job);
       saveStateToDisk();
-      executePullToTelegramJob(job).catch((err) => {
-        console.error('executePullToTelegramJob error:', err?.message);
-      });
+      if (IS_VERCEL) {
+        await executePullToTelegramJob(job);
+      } else {
+        executePullToTelegramJob(job).catch((err) => {
+          console.error('executePullToTelegramJob error:', err?.message);
+        });
+      }
       res.json({ ok: true, job });
       return;
     }
@@ -8220,9 +8427,13 @@ app.post('/api/transfers/url', async (req, res) => {
     transferJobs.unshift(job);
     saveStateToDisk();
     if (canUpload) {
-      executeTransferJob(job).catch((err) => {
-        console.error('executeTransferJob error:', err?.message);
-      });
+      if (IS_VERCEL) {
+        await executeTransferJob(job);
+      } else {
+        executeTransferJob(job).catch((err) => {
+          console.error('executeTransferJob error:', err?.message);
+        });
+      }
     }
 
     res.json({ ok: true, job });
@@ -8291,12 +8502,20 @@ app.post('/api/transfers/:id/retry', async (req, res) => {
   if (job.direction === 'to_telegram' || job.source === 'drive_to_telegram' || job.source === 'url_to_telegram') {
     job.status = 'queued';
     saveStateToDisk();
-    executePullToTelegramJob(job);
+    if (IS_VERCEL) {
+      await executePullToTelegramJob(job);
+    } else {
+      executePullToTelegramJob(job);
+    }
   } else {
     job.status = sess.accessToken && sess.accountEnabled ? 'queued' : 'waiting_auth';
     saveStateToDisk();
     if (sess.accessToken && sess.accountEnabled) {
-      executeTransferJob(job);
+      if (IS_VERCEL) {
+        await executeTransferJob(job);
+      } else {
+        executeTransferJob(job);
+      }
     }
   }
   res.json({ ok: true, job });

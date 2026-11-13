@@ -476,7 +476,12 @@ export default function App() {
         setPersonalChatId(cid);
         localStorage.setItem(STORAGE_CHAT_ID_KEY, cid);
       }
-      if (data.drive.connected && data.drive.activeAccessToken && !accessToken) {
+      if (
+        data.drive.connected &&
+        data.drive.activeAccessToken &&
+        !accessToken &&
+        localStorage.getItem('tg_drive_logged_out') !== '1'
+      ) {
         setAccessToken(data.drive.activeAccessToken);
         saveStoredToken(data.drive.activeAccessToken);
         if (data.drive.userEmail && !personalEmail) {
@@ -503,12 +508,14 @@ export default function App() {
   useEffect(() => {
     const unsubscribe = initAuth(
       (user, token) => {
+        localStorage.removeItem('tg_drive_logged_out');
         setAccessToken(token);
         setUnauthorizedDomainHost(null);
+        const providerProfile = user.providerData?.[0];
         onGoogleAuthenticated(token, {
-          name: user.displayName || undefined,
-          email: user.email || undefined,
-          picture: user.photoURL || undefined,
+          name: user.displayName || providerProfile?.displayName || undefined,
+          email: user.email || providerProfile?.email || undefined,
+          picture: user.photoURL || providerProfile?.photoURL || undefined,
         });
       },
       () => {}
@@ -586,6 +593,7 @@ export default function App() {
     knownProfile?: { name?: string; email?: string; picture?: string }
   ) => {
     try {
+      localStorage.removeItem('tg_drive_logged_out');
       let name = knownProfile?.name || 'مستخدم Google Drive';
       let email = knownProfile?.email || '';
       let picture: string | undefined = knownProfile?.picture;
@@ -606,20 +614,46 @@ export default function App() {
         }
       }
 
-      setUserProfile({ name, email, picture });
-      if (email) {
-        setPersonalEmail(email);
-        localStorage.setItem(STORAGE_EMAIL_KEY, email);
-      }
-      if (name) {
-        setPersonalName(name);
-        localStorage.setItem(STORAGE_NAME_KEY, name);
+      if (!email) {
+        try {
+          const aboutRes = await fetch(
+            'https://www.googleapis.com/drive/v3/about?fields=user(displayName,emailAddress,photoLink)',
+            {
+              headers: { Authorization: `Bearer ${token}` },
+            }
+          );
+          if (aboutRes.ok) {
+            const aboutData = await aboutRes.json();
+            if (aboutData?.user?.emailAddress) email = aboutData.user.emailAddress;
+            if (aboutData?.user?.displayName && name === 'مستخدم Google Drive') {
+              name = aboutData.user.displayName;
+            }
+            if (aboutData?.user?.photoLink && !picture) {
+              picture = aboutData.user.photoLink;
+            }
+          }
+        } catch {
+          // Ignore Drive about fallback error
+        }
       }
 
       const syncData = await syncTokenWithServer(token, email, name);
+      const finalEmail = email || syncData.userEmail || '';
+      const finalName = (name !== 'مستخدم Google Drive' ? name : syncData.userName) || name;
+
+      setUserProfile({ name: finalName, email: finalEmail, picture });
+      if (finalEmail) {
+        setPersonalEmail(finalEmail);
+        localStorage.setItem(STORAGE_EMAIL_KEY, finalEmail);
+      }
+      if (finalName) {
+        setPersonalName(finalName);
+        localStorage.setItem(STORAGE_NAME_KEY, finalName);
+      }
+
       setSelectedFolderId(syncData.activeFolderId);
       setSelectedFolderName(syncData.activeFolderName);
-      setBannerSuccess(`تم ربط حسابك الشخصي (${email || name}) ومجلد "${syncData.activeFolderName}" بنجاح!`);
+      setBannerSuccess(`تم ربط حسابك الشخصي (${finalEmail || finalName}) ومجلد "${syncData.activeFolderName}" بنجاح!`);
       setTimeout(() => setBannerSuccess(null), 5000);
 
       await refreshDriveFoldersAndFiles(token);
@@ -763,14 +797,16 @@ export default function App() {
   const handleSignIn = async () => {
     setBannerError(null);
     setUnauthorizedDomainHost(null);
+    localStorage.removeItem('tg_drive_logged_out');
     try {
       const result = await googleSignIn();
       if (result) {
         setAccessToken(result.accessToken);
+        const providerProfile = result.user.providerData?.[0];
         await onGoogleAuthenticated(result.accessToken, {
-          name: result.user.displayName || undefined,
-          email: result.user.email || undefined,
-          picture: result.user.photoURL || undefined,
+          name: result.user.displayName || providerProfile?.displayName || undefined,
+          email: result.user.email || providerProfile?.email || undefined,
+          picture: result.user.photoURL || providerProfile?.photoURL || undefined,
         });
         return;
       }
@@ -800,6 +836,7 @@ export default function App() {
   };
 
   const handleDisconnectDrive = async () => {
+    localStorage.setItem('tg_drive_logged_out', '1');
     try {
       await firebaseLogout();
     } catch {
@@ -822,6 +859,7 @@ export default function App() {
   };
 
   const handleClearPersonalSession = () => {
+    localStorage.setItem('tg_drive_logged_out', '1');
     clearStoredToken();
     localStorage.removeItem(STORAGE_EMAIL_KEY);
     localStorage.removeItem(STORAGE_NAME_KEY);
@@ -1538,6 +1576,7 @@ export default function App() {
         headers,
         body: JSON.stringify({
           url: externalUrlInput.trim(),
+          sourceUrl: matchedFmt?.sourceStreamUrl || undefined,
           customFileName: safeCustomName,
           destination: externalDestination,
           mediaFormat: externalMediaFormat,
