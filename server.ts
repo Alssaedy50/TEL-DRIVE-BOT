@@ -110,6 +110,11 @@ export interface KnownTelegramUser {
 export interface UserDriveProfile {
   profileId: string;
   accessToken: string | null;
+  refreshToken?: string | null;
+  tokenExpiresAt?: number | null;
+  tokenExpired?: boolean;
+  customClientId?: string | null;
+  customClientSecret?: string | null;
   userEmail: string | null;
   userName: string | null;
   chatId: number | null;
@@ -137,11 +142,17 @@ export interface AdminConfigState {
   urlHandlingMode: 'ask' | 'to_drive' | 'to_telegram';
   defaultQuality: string;
   defaultCompressMode: CompressMode;
+  customBotToken?: string | null;
+  customApiId?: number | null;
+  customApiHash?: string | null;
+  customApiRoot?: string | null;
   knownUsers: Record<string, KnownTelegramUser>;
 }
 
 interface DriveSessionState {
   accessToken: string | null;
+  refreshToken?: string | null;
+  tokenExpiresAt?: number | null;
   userEmail: string | null;
   userName: string | null;
   activeFolderId: string | null;
@@ -159,6 +170,8 @@ const DEFAULT_TELEGRAM_API_HASH = 'b18441a1ff607e10a989891a5462e627';
 
 const driveSession: DriveSessionState = {
   accessToken: null,
+  refreshToken: null,
+  tokenExpiresAt: null,
   userEmail: null,
   userName: null,
   activeFolderId: null,
@@ -176,6 +189,10 @@ const adminConfig: AdminConfigState = {
   urlHandlingMode: 'ask',
   defaultQuality: '720',
   defaultCompressMode: 'none',
+  customBotToken: null,
+  customApiId: null,
+  customApiHash: null,
+  customApiRoot: null,
   knownUsers: {},
 };
 
@@ -259,6 +276,8 @@ if (driveSession.userEmail) {
     userProfiles[normEmail] = {
       profileId: normEmail,
       accessToken: driveSession.accessToken,
+      refreshToken: driveSession.refreshToken || null,
+      tokenExpiresAt: driveSession.tokenExpiresAt || null,
       userEmail: driveSession.userEmail,
       userName: driveSession.userName,
       chatId: adminConfig.ownerChatId,
@@ -422,23 +441,211 @@ function saveStateToDisk() {
 }
 
 function getBotToken(): string {
+  const custom = (adminConfig.customBotToken || '').trim();
+  if (custom) return custom;
   return (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 }
 
+function getMaskedBotToken(): string | null {
+  const tok = getBotToken();
+  if (!tok) return null;
+  const colonIdx = tok.indexOf(':');
+  if (colonIdx > 0 && tok.length > colonIdx + 8) {
+    return `${tok.slice(0, colonIdx + 4)}...${tok.slice(-4)}`;
+  }
+  return `${tok.slice(0, 6)}...`;
+}
+
 function getApiId(): number {
+  if (adminConfig.customApiId && adminConfig.customApiId > 0) {
+    return adminConfig.customApiId;
+  }
   const raw = (process.env.TELEGRAM_API_ID || '').trim();
   const parsed = parseInt(raw, 10);
   return !isNaN(parsed) && parsed > 0 ? parsed : DEFAULT_TELEGRAM_API_ID;
 }
 
 function getApiHash(): string {
+  const custom = (adminConfig.customApiHash || '').trim();
+  if (custom) return custom;
   const raw = (process.env.TELEGRAM_API_HASH || '').trim();
   return raw || DEFAULT_TELEGRAM_API_HASH;
 }
 
 function getTelegramApiRoot(): string {
-  const custom = (process.env.TELEGRAM_API_ROOT || '').trim();
+  const custom = (adminConfig.customApiRoot || process.env.TELEGRAM_API_ROOT || '').trim();
   return custom ? custom.replace(/\/+$/, '') : 'https://api.telegram.org';
+}
+
+function invalidateExpiredProfileToken(prof: UserDriveProfile | null | undefined, _reason?: string) {
+  if (!prof) return;
+  prof.accessToken = null;
+  prof.tokenExpired = true;
+  if (
+    !adminConfig.ownerChatId ||
+    prof.chatId === adminConfig.ownerChatId ||
+    (prof.userEmail &&
+      driveSession.userEmail &&
+      prof.userEmail.toLowerCase() === driveSession.userEmail.toLowerCase())
+  ) {
+    driveSession.accessToken = null;
+  }
+  saveStateToDisk();
+}
+
+const tokenRefreshPromises = new Map<string, Promise<string | null>>();
+
+async function refreshUserDriveToken(prof: UserDriveProfile): Promise<string | null> {
+  const refreshTok = (prof.refreshToken || driveSession.refreshToken || '').trim();
+  if (!refreshTok) {
+    invalidateExpiredProfileToken(prof);
+    return null;
+  }
+
+  const lockKey = prof.profileId || prof.userEmail || 'default';
+  if (tokenRefreshPromises.has(lockKey)) {
+    return tokenRefreshPromises.get(lockKey)!;
+  }
+
+  const runRefresh = async (): Promise<string | null> => {
+    const clientId = (prof.customClientId || process.env.GOOGLE_CLIENT_ID || '').trim();
+    const clientSecret = (prof.customClientSecret || process.env.GOOGLE_CLIENT_SECRET || '').trim();
+
+    let newAccessToken = '';
+    let expiresInSec = 3500;
+
+    // 1. Try standard OAuth2 token endpoint if clientId + clientSecret are configured
+    if (clientId && clientSecret) {
+      try {
+        const body = new URLSearchParams({
+          client_id: clientId,
+          client_secret: clientSecret,
+          refresh_token: refreshTok,
+          grant_type: 'refresh_token',
+        });
+        const res = await fetch('https://oauth2.googleapis.com/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: body.toString(),
+          signal: AbortSignal.timeout(10000),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data?.access_token) {
+            newAccessToken = String(data.access_token).trim();
+            if (Number(data.expires_in) > 0) expiresInSec = Number(data.expires_in);
+          }
+        }
+      } catch {
+        // Fall through to OAuth Playground refresh endpoint
+      }
+    }
+
+    // 2. Try Google OAuth Playground public refresh endpoint (works with any 1//04... refresh token from OAuth Playground)
+    if (!newAccessToken) {
+      try {
+        const pgRes = await fetch('https://developers.google.com/oauthplayground/refreshAccessToken', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify({
+            token_uri: 'https://oauth2.googleapis.com/token',
+            refresh_token: refreshTok,
+          }),
+          signal: AbortSignal.timeout(10000),
+        });
+        if (pgRes.ok) {
+          const pgData = await pgRes.json();
+          if (pgData?.access_token) {
+            newAccessToken = String(pgData.access_token).trim();
+            if (Number(pgData.expires_in) > 0) expiresInSec = Number(pgData.expires_in);
+          }
+        }
+      } catch {
+        // Ignore
+      }
+    }
+
+    if (newAccessToken) {
+      prof.accessToken = newAccessToken;
+      prof.tokenExpiresAt = Date.now() + Math.max(300, expiresInSec - 180) * 1000;
+      prof.tokenExpired = false;
+      prof.lastSyncedAt = new Date().toISOString();
+      if (
+        !adminConfig.ownerChatId ||
+        prof.chatId === adminConfig.ownerChatId ||
+        (prof.userEmail &&
+          driveSession.userEmail &&
+          prof.userEmail.toLowerCase() === driveSession.userEmail.toLowerCase())
+      ) {
+        driveSession.accessToken = newAccessToken;
+        driveSession.tokenExpiresAt = prof.tokenExpiresAt;
+        driveSession.lastSyncedAt = prof.lastSyncedAt;
+      }
+      saveStateToDisk();
+      return newAccessToken;
+    }
+
+    invalidateExpiredProfileToken(prof);
+    return null;
+  };
+
+  const p = runRefresh().finally(() => {
+    tokenRefreshPromises.delete(lockKey);
+  });
+  tokenRefreshPromises.set(lockKey, p);
+  return p;
+}
+
+async function ensureValidDriveToken(
+  prof: UserDriveProfile | null | undefined,
+  forceVerifyWithGoogle = false
+): Promise<string | null> {
+  if (!prof) return null;
+
+  const now = Date.now();
+  const isNearExpiry = Boolean(prof.tokenExpiresAt && now > prof.tokenExpiresAt - 2 * 60 * 1000);
+
+  if ((!prof.accessToken || isNearExpiry) && prof.refreshToken) {
+    const refreshed = await refreshUserDriveToken(prof);
+    if (refreshed) return refreshed;
+  }
+
+  if (!prof.accessToken) {
+    return null;
+  }
+
+  if (forceVerifyWithGoogle || !prof.tokenExpiresAt || isNearExpiry) {
+    try {
+      const checkRes = await fetch(
+        'https://www.googleapis.com/drive/v3/about?fields=user(displayName,emailAddress)',
+        {
+          headers: { Authorization: `Bearer ${prof.accessToken}` },
+          signal: AbortSignal.timeout(7000),
+        }
+      );
+      if (checkRes.status === 401 || checkRes.status === 403) {
+        if (prof.refreshToken) {
+          return await refreshUserDriveToken(prof);
+        }
+        invalidateExpiredProfileToken(prof);
+        return null;
+      }
+      if (checkRes.ok) {
+        if (!prof.tokenExpiresAt || isNearExpiry) {
+          prof.tokenExpiresAt = Date.now() + 25 * 60 * 1000;
+        }
+        prof.tokenExpired = false;
+        saveStateToDisk();
+      }
+    } catch {
+      // Network transient warning — keep token as-is
+    }
+  }
+
+  return prof.accessToken;
 }
 
 function getAppUrl(chatId?: number | null): string {
@@ -718,6 +925,22 @@ async function getMtprotoMessageForJob(job: TransferJob): Promise<any | null> {
     if (res && Array.isArray(res.messages) && res.messages.length > 0 && res.messages[0]?.media) {
       return res.messages[0];
     }
+
+    // Channel / Supergroup fallback where messages have per-channel IDs
+    if (job.chatId && String(job.chatId).startsWith('-100')) {
+      const peer = await resolveMtprotoPeerForChat(mtprotoClient, job.chatId, job.messageId);
+      if (peer) {
+        const chRes: any = await mtprotoClient.invoke(
+          new Api.channels.GetMessages({
+            channel: peer,
+            id: [new Api.InputMessageID({ id: job.messageId })],
+          })
+        );
+        if (chRes && Array.isArray(chRes.messages) && chRes.messages.length > 0 && chRes.messages[0]?.media) {
+          return chRes.messages[0];
+        }
+      }
+    }
   } catch (err) {
     console.warn('MTProto GetMessages error:', err);
   }
@@ -732,7 +955,7 @@ async function getMtprotoMessageForJob(job: TransferJob): Promise<any | null> {
 async function telegramApi<T = any>(method: string, body?: Record<string, any>, signal?: AbortSignal): Promise<T> {
   const token = getBotToken();
   if (!token) {
-    throw new Error('TELEGRAM_BOT_TOKEN غير مضاف في قسم الأسرار (Secrets).');
+    throw new Error('رموز البوت (TELEGRAM_BOT_TOKEN) غير مضافة بعد. يمكنك إدخال توكن البوت مباشرة من داخل التطبيق.');
   }
   const url = `${getTelegramApiRoot()}/bot${token}/${method}`;
   const res = await fetch(url, {
@@ -833,11 +1056,7 @@ function getEffectiveSessionForChat(chatId?: number | null): {
   defaultQuality: string;
   defaultCompressMode: CompressMode;
 } {
-  const prof =
-    (chatId ? getOrCreateUserProfile({ chatId, createIfMissing: true }) : null) ||
-    (driveSession.userEmail
-      ? getOrCreateUserProfile({ email: driveSession.userEmail, createIfMissing: true })
-      : null);
+  const prof = chatId ? getOrCreateUserProfile({ chatId, createIfMissing: true }) : null;
 
   if (prof && prof.accessToken) {
     return {
@@ -856,14 +1075,16 @@ function getEffectiveSessionForChat(chatId?: number | null): {
     };
   }
 
-  // If this is the owner or fallback when user hasn't linked a separate Drive yet
-  const isOwner = !chatId || chatId === adminConfig.ownerChatId;
+  // Only fall back to legacy owner driveSession if this chatId explicitly belongs to the owner
+  const isOwner = Boolean(chatId && adminConfig.ownerChatId && chatId === adminConfig.ownerChatId);
   if (isOwner && driveSession.accessToken) {
     const fallbackProf =
       prof ||
       ({
         profileId: 'default',
         accessToken: driveSession.accessToken,
+        refreshToken: driveSession.refreshToken || null,
+        tokenExpiresAt: driveSession.tokenExpiresAt || null,
         userEmail: driveSession.userEmail,
         userName: driveSession.userName,
         chatId: chatId || adminConfig.ownerChatId,
@@ -3356,10 +3577,18 @@ async function uploadBufferToDrivePaced(
     };
     abortSignal.addEventListener('abort', onAbort, { once: true });
 
-    const timeoutHandle = setTimeout(() => {
+    let timeoutHandle: ReturnType<typeof setTimeout> = setTimeout(() => {
       req.destroy(new Error('DRIVE_PUT_TIMEOUT'));
       finishReject(new Error('DRIVE_PUT_TIMEOUT'));
-    }, 12000);
+    }, 45000);
+
+    const resetTimeout = () => {
+      clearTimeout(timeoutHandle);
+      timeoutHandle = setTimeout(() => {
+        req.destroy(new Error('DRIVE_PUT_TIMEOUT'));
+        finishReject(new Error('DRIVE_PUT_TIMEOUT'));
+      }, 45000);
+    };
 
     req.on('error', finishReject);
 
@@ -3382,16 +3611,19 @@ async function uploadBufferToDrivePaced(
 
           const endOff = Math.min(off + DRIVE_WRITE_SLICE_BYTES, bufferToSend.byteLength);
           const slice = bufferToSend.subarray(off, endOff);
+          resetTimeout();
           const ok = req.write(slice);
           if (!ok && !settled) {
             await new Promise<void>((r) => req.once('drain', r));
           }
+          resetTimeout();
           if (onProgressBytes) {
             onProgressBytes(endOff);
           }
           sliceIdx++;
         }
         if (!settled) {
+          resetTimeout();
           req.end();
         }
       } catch (writeErr: any) {
@@ -3436,7 +3668,8 @@ async function streamAsyncIterableToDrive(
   targetFolderName: string,
   chunkSource: AsyncIterable<Uint8Array>,
   abortSignal: AbortSignal,
-  initialUploadedOffset: number = 0
+  initialUploadedOffset: number = 0,
+  userProfile?: UserDriveProfile
 ): Promise<any> {
   const startTime = Date.now();
   let lastTelegramEditTime = 0;
@@ -3503,7 +3736,10 @@ async function streamAsyncIterableToDrive(
 
         if (res.status !== 308 && (res.status < 200 || res.status >= 300)) {
           if (res.status === 401 || res.status === 403) {
-            driveSession.accessToken = null;
+            invalidateExpiredProfileToken(
+              userProfile,
+              'انتهت صلاحية جلسة Google Drive. يرجى تحديث الاتصال من لوحة التحكم.'
+            );
             job.status = 'waiting_auth';
             throw new Error('انتهت صلاحية جلسة Google Drive. يرجى تحديث الاتصال من لوحة التحكم.');
           }
@@ -3600,7 +3836,10 @@ async function streamAsyncIterableToDrive(
 
       if (finalRes.status < 200 || finalRes.status >= 300) {
         if (finalRes.status === 401 || finalRes.status === 403) {
-          driveSession.accessToken = null;
+          invalidateExpiredProfileToken(
+            userProfile,
+            'انتهت صلاحية جلسة Google Drive. يرجى تحديث الاتصال من لوحة التحكم.'
+          );
           job.status = 'waiting_auth';
           throw new Error('انتهت صلاحية جلسة Google Drive. يرجى تحديث الاتصال من لوحة التحكم.');
         }
@@ -3736,17 +3975,21 @@ function resolveJobDriveSession(job: TransferJob): {
   return getEffectiveSessionForChat(job.chatId);
 }
 
-async function executeTransferJob(job: TransferJob): Promise<void> {
+async function executeTransferJob(job: TransferJob, isTokenRetry: boolean = false): Promise<void> {
   if (job.status === 'cancelled') return;
 
   const userSess = resolveJobDriveSession(job);
-  if (!userSess.accessToken || !userSess.accountEnabled) {
+  const ensuredToken = await ensureValidDriveToken(userSess.profile, true);
+  if (!ensuredToken || !userSess.accountEnabled) {
     job.status = 'waiting_auth';
+    if (!ensuredToken) {
+      job.errorMessage = 'انتهت صلاحية جلسة Google Drive أو لم يتم ربط الحساب بعد. يرجى تنشيط الاتصال من لوحة التحكم.';
+    }
     saveStateToDisk();
     return;
   }
 
-  const token = userSess.accessToken;
+  const token = ensuredToken;
   job.accountEmail = userSess.userEmail || job.accountEmail || 'default';
 
   const abortController = new AbortController();
@@ -3772,7 +4015,7 @@ async function executeTransferJob(job: TransferJob): Promise<void> {
       const folder = await ensureDriveFolder(token, targetFolderName);
       userSess.profile.activeFolderId = folder.id;
       userSess.profile.activeFolderName = folder.name;
-      if (!job.chatId || job.chatId === adminConfig.ownerChatId) {
+      if (job.chatId && job.chatId === adminConfig.ownerChatId) {
         driveSession.activeFolderId = folder.id;
         driveSession.activeFolderName = folder.name;
       }
@@ -4086,7 +4329,8 @@ async function executeTransferJob(job: TransferJob): Promise<void> {
       targetFolderName,
       sourceAsyncStream,
       signal,
-      resumeOffset
+      resumeOffset,
+      userSess.profile
     );
 
     jobAbortControllers.delete(job.id);
@@ -4147,7 +4391,21 @@ async function executeTransferJob(job: TransferJob): Promise<void> {
       return;
     }
 
-    if (job.status !== 'waiting_auth') {
+    const isAuthExpiredError =
+      rawMsg.includes('انتهت صلاحية') ||
+      rawMsg.includes('401') ||
+      rawMsg.toLowerCase().includes('invalid credentials');
+
+    if (isAuthExpiredError) {
+      if (!isTokenRetry && userSess.profile.refreshToken) {
+        const refreshed = await refreshUserDriveToken(userSess.profile);
+        if (refreshed) {
+          return executeTransferJob(job, true);
+        }
+      }
+      invalidateExpiredProfileToken(userSess.profile, rawMsg);
+      job.status = 'waiting_auth';
+    } else if (job.status !== 'waiting_auth') {
       job.status = 'failed';
     }
     job.errorMessage = rawMsg;
@@ -4427,23 +4685,39 @@ async function executePullToTelegramJob(job: TransferJob): Promise<void> {
     let responseStream: ReadableStream<Uint8Array> | null = null;
 
     if (job.source === 'drive_to_telegram' && job.driveFileId) {
-      if (!userSess.accessToken) {
+      let token = await ensureValidDriveToken(userSess.profile, true);
+      if (!token) {
         job.status = 'waiting_auth';
         saveStateToDisk();
         throw new Error('يرجى ربط أو تنشيط جلسة Google Drive أولاً.');
       }
 
-      const token = userSess.accessToken;
-      const metaRes = await fetch(
+      let metaRes = await fetch(
         `https://www.googleapis.com/drive/v3/files/${job.driveFileId}?fields=id,name,mimeType,size,webViewLink`,
         {
           headers: { Authorization: `Bearer ${token}` },
           signal,
         }
       );
+      if ((metaRes.status === 401 || metaRes.status === 403) && userSess.profile.refreshToken) {
+        const refreshed = await refreshUserDriveToken(userSess.profile);
+        if (refreshed) {
+          token = refreshed;
+          metaRes = await fetch(
+            `https://www.googleapis.com/drive/v3/files/${job.driveFileId}?fields=id,name,mimeType,size,webViewLink`,
+            {
+              headers: { Authorization: `Bearer ${token}` },
+              signal,
+            }
+          );
+        }
+      }
       if (!metaRes.ok) {
         if (metaRes.status === 401 || metaRes.status === 403) {
-          userSess.profile.accessToken = null;
+          invalidateExpiredProfileToken(
+            userSess.profile,
+            'انتهت صلاحية جلسة Google Drive. يرجى تنشيطها من الموقع.'
+          );
           job.status = 'waiting_auth';
           throw new Error('انتهت صلاحية جلسة Google Drive. يرجى تنشيطها من الموقع.');
         }
@@ -6351,10 +6625,16 @@ function resolveRequestUserContext(req: express.Request): {
   const parsedChatId = Number(rawChatId);
   const validChatId = !isNaN(parsedChatId) && parsedChatId !== 0 ? parsedChatId : null;
 
+  const authHeader = req.headers.authorization;
+  const bearerToken =
+    authHeader && authHeader.startsWith('Bearer ') ? authHeader.replace('Bearer ', '').trim() : '';
+
   const matchedProf = emailKey
     ? userProfiles[emailKey] ||
       (cleanEmail ? userProfiles[cleanEmail] : undefined) ||
       Object.values(userProfiles).find((p) => p.userEmail && p.userEmail.trim().toLowerCase() === emailKey)
+    : bearerToken
+    ? Object.values(userProfiles).find((p) => p.accessToken === bearerToken)
     : undefined;
 
   if (matchedProf) {
@@ -6415,10 +6695,11 @@ function resolveRequestUserContext(req: express.Request): {
     };
   }
 
+  // Anonymous/unlinked browser: return isolated guest context without leaking owner email/chatId
   const fallbackSess = getEffectiveSessionForChat(undefined);
   return {
-    userEmail: fallbackSess.userEmail,
-    chatId: fallbackSess.profile.chatId || adminConfig.ownerChatId,
+    userEmail: null,
+    chatId: null,
     profile: fallbackSess.profile,
     session: fallbackSess,
   };
@@ -6438,7 +6719,7 @@ app.post('/api/telegram/webhook', async (req, res) => {
 
 app.post('/api/bot/webhook', async (req, res) => {
   if (!getBotToken()) {
-    res.status(400).json({ error: 'يرجى إضافة TELEGRAM_BOT_TOKEN في متغيرات البيئة (Environment Variables) أولاً.' });
+    res.status(400).json({ error: 'يرجى إدخال وتفعيل توكن بوت تليجرام (TELEGRAM_BOT_TOKEN) من إعدادات البوت أولاً.' });
     return;
   }
   const customOrigin = typeof req.body?.origin === 'string' ? req.body.origin.trim().replace(/\/+$/, '') : '';
@@ -6487,11 +6768,17 @@ app.get('/api/status', async (req, res) => {
   const ctx = resolveRequestUserContext(req);
   const { profile, session } = ctx;
 
-  // Scope jobs to the current user unless they explicitly have no personal identity yet
+  // Proactively check/refresh user's Drive token if they have a personal identity
   const hasPersonalIdentity = Boolean(ctx.userEmail || ctx.chatId);
+  if (hasPersonalIdentity && (profile.accessToken || profile.refreshToken)) {
+    const validTok = await ensureValidDriveToken(profile, false);
+    session.accessToken = validTok;
+  }
+
+  // Scope jobs to the current user (or show empty/own list for unlinked browser)
   const scopedJobs = hasPersonalIdentity
     ? getJobsForUser(ctx.chatId || undefined, ctx.userEmail)
-    : getJobsForUser(adminConfig.ownerChatId || undefined, driveSession.userEmail);
+    : [];
 
   const completedScoped = scopedJobs.filter((j) => j.status === 'completed');
   const totalBytesScoped = completedScoped.reduce((acc, j) => acc + (j.bytesTransferred || j.totalBytes || 0), 0);
@@ -6520,6 +6807,8 @@ app.get('/api/status', async (req, res) => {
       connected: Boolean(botInfo && (isPolling || isWebhookRegistered || IS_VERCEL)),
       info: botInfo,
       error: botConnectionError,
+      maskedToken: getMaskedBotToken(),
+      hasCustomBotToken: Boolean(adminConfig.customBotToken),
       apiRoot: getTelegramApiRoot(),
       isCustomApiRoot: getTelegramApiRoot() !== 'https://api.telegram.org',
       mtproto: {
@@ -6527,11 +6816,16 @@ app.get('/api/status', async (req, res) => {
         connected: mtprotoConnected,
         error: mtprotoError,
         maxFileSizeLabel: mtprotoConnected ? '2,000 MB (2 GB)' : '20 MB (قياسي)',
+        customApiId: adminConfig.customApiId || '',
+        hasCustomApiHash: Boolean(adminConfig.customApiHash),
       },
     },
     drive: {
-      connected: Boolean(session.accessToken),
-      activeAccessToken: session.accessToken || null,
+      connected: Boolean(session.accessToken && !profile.tokenExpired),
+      activeAccessToken: session.accessToken && !profile.tokenExpired ? session.accessToken : null,
+      tokenExpiresAt: profile.tokenExpiresAt || null,
+      hasRefreshToken: Boolean(profile.refreshToken),
+      tokenExpired: Boolean(profile.tokenExpired),
       accountEnabled: session.accountEnabled,
       userEmail: session.userEmail,
       userName: session.userName,
@@ -6542,7 +6836,7 @@ app.get('/api/status', async (req, res) => {
       urlHandlingMode: session.urlHandlingMode,
       defaultQuality: session.defaultQuality || '720',
       defaultCompressMode: session.defaultCompressMode || 'none',
-      lastSyncedAt: profile.lastSyncedAt || driveSession.lastSyncedAt,
+      lastSyncedAt: profile.lastSyncedAt || null,
       linkCode: profile.linkCode,
       linkedChatId: profile.chatId || null,
       linkedTelegramName: profile.telegramName || null,
@@ -6555,7 +6849,7 @@ app.get('/api/status', async (req, res) => {
       accessMode: adminConfig.accessMode,
       botPaused: adminConfig.botPaused,
       knownUsers: enrichedKnownUsers,
-      connectedProfilesCount: Object.values(userProfiles).filter((p) => Boolean(p.accessToken)).length,
+      connectedProfilesCount: Object.values(userProfiles).filter((p) => Boolean(p.accessToken && !p.tokenExpired)).length,
       globalStats: {
         totalJobs: transferJobs.length,
         completedJobs: globalCompleted.length,
@@ -6585,13 +6879,133 @@ app.post('/api/bot/reconnect', async (_req, res) => {
   await startTelegramServices();
   res.json({
     configured: Boolean(getBotToken()),
-    connected: Boolean(botInfo && isPolling),
+    connected: Boolean(botInfo && (isPolling || isWebhookRegistered || IS_VERCEL)),
     info: botInfo,
     error: botConnectionError,
+    maskedToken: getMaskedBotToken(),
     mtproto: {
       configured: Boolean(getApiId() && getApiHash()),
       connected: mtprotoConnected,
       error: mtprotoError,
+    },
+  });
+});
+
+// Configure or update Telegram Bot Token & optional MTProto credentials directly from the web app
+app.post('/api/bot/config', async (req, res) => {
+  const { botToken, apiId, apiHash, apiRoot, clearToken } = req.body || {};
+
+  if (clearToken === true) {
+    adminConfig.customBotToken = null;
+    if (isPolling && pollingAbortController) {
+      pollingAbortController.abort();
+      isPolling = false;
+    }
+    botInfo = null;
+    saveStateToDisk();
+    await startTelegramServices();
+    res.json({
+      ok: true,
+      configured: Boolean(getBotToken()),
+      connected: Boolean(botInfo),
+      info: botInfo,
+      maskedToken: getMaskedBotToken(),
+    });
+    return;
+  }
+
+  const cleanToken = typeof botToken === 'string' ? botToken.trim() : '';
+  const cleanApiId = apiId !== undefined && apiId !== null ? String(apiId).trim() : undefined;
+  const cleanApiHash = typeof apiHash === 'string' ? apiHash.trim() : undefined;
+  const cleanApiRoot = typeof apiRoot === 'string' ? apiRoot.trim().replace(/\/+$/, '') : undefined;
+
+  if (!cleanToken && !getBotToken()) {
+    res.status(400).json({
+      error: 'يرجى إدخال توكن بوت تليجرام صالح (مثال: 123456789:ABCdefGHIjklMNOpqrsTUVwxyz).',
+    });
+    return;
+  }
+
+  if (cleanToken) {
+    if (!/^\d{6,15}:[A-Za-z0-9_-]{20,}$/.test(cleanToken)) {
+      res.status(400).json({
+        error: 'صيغة توكن البوت غير صحيحة. يجب أن يكون بالصيغة: 123456789:ABCdef... من @BotFather.',
+      });
+      return;
+    }
+
+    // Verify token live against Telegram getMe before saving
+    const effectiveRoot = cleanApiRoot || getTelegramApiRoot();
+    try {
+      const verifyRes = await fetch(`${effectiveRoot}/bot${cleanToken}/getMe`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+        signal: AbortSignal.timeout(12000),
+      });
+      const verifyData = await verifyRes.json().catch(() => ({}));
+      if (!verifyRes.ok || !verifyData?.ok || !verifyData?.result) {
+        res.status(400).json({
+          error:
+            verifyData?.description ||
+            `رفض خادم تليجرام هذا التوكن (HTTP ${verifyRes.status}). تأكد من نسخ التوكن الصحيح من @BotFather.`,
+        });
+        return;
+      }
+    } catch (verifyErr: any) {
+      res.status(400).json({
+        error: `تعذر التحقق من التوكن مع خادم تليجرام: ${verifyErr?.message || 'خطأ في الاتصال'}`,
+      });
+      return;
+    }
+
+    const tokenChanged = cleanToken !== getBotToken();
+    adminConfig.customBotToken = cleanToken;
+    process.env.TELEGRAM_BOT_TOKEN = cleanToken;
+
+    if (tokenChanged) {
+      // Clear cached MTProto bot sessions so the new bot token initializes its own MTProto session
+      for (const sessionFile of [MTPROTO_SESSION_PATH, MTPROTO_POOL_CACHE_PATH]) {
+        if (fs.existsSync(sessionFile)) {
+          try {
+            fs.unlinkSync(sessionFile);
+          } catch {
+            // Ignore unlink error
+          }
+        }
+      }
+      mtprotoConnected = false;
+      mtprotoClient = null;
+      mtprotoPoolClients.length = 0;
+    }
+  }
+
+  if (cleanApiId !== undefined) {
+    const parsedApiId = parseInt(String(cleanApiId), 10);
+    adminConfig.customApiId = !isNaN(parsedApiId) && parsedApiId > 0 ? parsedApiId : null;
+  }
+  if (cleanApiHash !== undefined && !cleanApiHash.includes('••')) {
+    adminConfig.customApiHash = cleanApiHash || null;
+  }
+  if (cleanApiRoot !== undefined) {
+    adminConfig.customApiRoot = cleanApiRoot || null;
+  }
+
+  saveStateToDisk();
+  await startTelegramServices();
+
+  res.json({
+    ok: true,
+    configured: Boolean(getBotToken()),
+    connected: Boolean(botInfo && (isPolling || isWebhookRegistered || IS_VERCEL)),
+    info: botInfo,
+    error: botConnectionError,
+    maskedToken: getMaskedBotToken(),
+    mtproto: {
+      configured: Boolean(getApiId() && getApiHash()),
+      connected: mtprotoConnected,
+      error: mtprotoError,
+      maxFileSizeLabel: mtprotoConnected ? '2,000 MB (2 GB)' : '20 MB (قياسي)',
     },
   });
 });
@@ -6614,6 +7028,10 @@ app.post('/api/drive/sync', async (req, res) => {
     deduplicate,
     accountEnabled,
     urlHandlingMode,
+    expiresInSec,
+    refreshToken,
+    clientId,
+    clientSecret,
   } = req.body || {};
 
   const parsedChatId = Number(chatId);
@@ -6621,34 +7039,41 @@ app.post('/api/drive/sync', async (req, res) => {
   let cleanEmail = typeof userEmail === 'string' && userEmail.trim() ? userEmail.trim() : undefined;
   let resolvedUserName = typeof userName === 'string' && userName.trim() ? userName.trim() : undefined;
 
-  // Automatically discover user's email & displayName from Google Drive / OAuth2 API if not provided by client
-  if (!cleanEmail) {
-    try {
-      const aboutRes = await fetch(
-        'https://www.googleapis.com/drive/v3/about?fields=user(displayName,emailAddress)',
-        {
-          headers: { Authorization: `Bearer ${token}` },
-        }
-      );
-      if (aboutRes.ok) {
-        const aboutData = await aboutRes.json();
-        if (aboutData?.user?.emailAddress) {
-          cleanEmail = String(aboutData.user.emailAddress).trim();
-        }
-        if (!resolvedUserName && aboutData?.user?.displayName) {
-          resolvedUserName = String(aboutData.user.displayName).trim();
-        }
+  // Verify token & discover user's email & displayName from Google Drive / OAuth2 API
+  let tokenVerified = false;
+  try {
+    const aboutRes = await fetch(
+      'https://www.googleapis.com/drive/v3/about?fields=user(displayName,emailAddress)',
+      {
+        headers: { Authorization: `Bearer ${token}` },
       }
-    } catch {
-      // Continue to oauth2 userinfo fallback
+    );
+    if (aboutRes.ok) {
+      tokenVerified = true;
+      const aboutData = await aboutRes.json();
+      if (aboutData?.user?.emailAddress) {
+        cleanEmail = String(aboutData.user.emailAddress).trim();
+      }
+      if (!resolvedUserName && aboutData?.user?.displayName) {
+        resolvedUserName = String(aboutData.user.displayName).trim();
+      }
+    } else if (aboutRes.status === 401) {
+      res.status(401).json({
+        error: 'انتهت صلاحية رمز Google Drive المرسل. يرجى الضغط على "تحديث/ربط حساب Google Drive" لتجديد الجلسة.',
+      });
+      return;
     }
+  } catch {
+    // Continue to oauth2 userinfo fallback
   }
-  if (!cleanEmail) {
+
+  if (!cleanEmail || !tokenVerified) {
     try {
       const infoRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (infoRes.ok) {
+        tokenVerified = true;
         const infoData = await infoRes.json();
         if (infoData?.email) {
           cleanEmail = String(infoData.email).trim();
@@ -6665,9 +7090,24 @@ app.post('/api/drive/sync', async (req, res) => {
   const prof = getOrCreateUserProfile({ email: cleanEmail, chatId: validChatId });
   const wasUnlinkedOrDifferentEmail =
     !prof.accessToken ||
+    prof.tokenExpired ||
     (cleanEmail && (!prof.userEmail || prof.userEmail.toLowerCase() !== cleanEmail.toLowerCase()));
 
   prof.accessToken = token;
+  prof.tokenExpired = false;
+  const ttlSeconds = Number(expiresInSec) > 60 ? Number(expiresInSec) : 3500;
+  prof.tokenExpiresAt = Date.now() + ttlSeconds * 1000;
+
+  if (typeof refreshToken === 'string' && refreshToken.trim()) {
+    prof.refreshToken = refreshToken.trim();
+  }
+  if (typeof clientId === 'string' && clientId.trim()) {
+    prof.customClientId = clientId.trim();
+  }
+  if (typeof clientSecret === 'string' && clientSecret.trim()) {
+    prof.customClientSecret = clientSecret.trim();
+  }
+
   if (cleanEmail) prof.userEmail = cleanEmail;
   if (resolvedUserName !== undefined) prof.userName = resolvedUserName;
   if (validChatId) {
@@ -6724,6 +7164,8 @@ app.post('/api/drive/sync', async (req, res) => {
     // Update legacy owner globals if this user is the owner or no active owner token is set yet
     if (!adminConfig.ownerChatId || !driveSession.accessToken || prof.chatId === adminConfig.ownerChatId) {
       driveSession.accessToken = prof.accessToken;
+      driveSession.refreshToken = prof.refreshToken || null;
+      driveSession.tokenExpiresAt = prof.tokenExpiresAt || null;
       driveSession.userEmail = prof.userEmail;
       driveSession.userName = prof.userName;
       driveSession.activeFolderId = prof.activeFolderId;
@@ -6755,6 +7197,7 @@ app.post('/api/drive/sync', async (req, res) => {
         `✅ <b>تم ربط وتنشيط حسابك الشخصي في Google Drive من الموقع بنجاح!</b>\n\n` +
           `📧 <b>الحساب:</b> <code>${prof.userEmail || 'متصل'}</code>\n` +
           `📁 <b>المجلد النشط:</b> <code>${prof.activeFolderName}</code>\n` +
+          `${prof.refreshToken ? '♾️ <b>نوع الربط:</b> دائم ومستمر تلقائياً (24/7 Refresh Token)\n' : ''}` +
           `🚀 سيتم الآن رفع جميع ملفاتك مباشرة إلى حسابك الشخصي!`,
         undefined,
         buildMainControlKeyboard(validChatId)
@@ -6763,6 +7206,9 @@ app.post('/api/drive/sync', async (req, res) => {
 
     res.json({
       ok: true,
+      accessToken: prof.accessToken,
+      tokenExpiresAt: prof.tokenExpiresAt,
+      hasRefreshToken: Boolean(prof.refreshToken),
       userEmail: prof.userEmail,
       userName: prof.userName,
       activeFolderId: prof.activeFolderId,
@@ -6779,11 +7225,200 @@ app.post('/api/drive/sync', async (req, res) => {
   }
 });
 
+// Direct Token / Refresh Token Linking (Bypasses 403 access_denied & enables 24/7 permanent auto-renewal)
+app.post('/api/drive/connect-token', async (req, res) => {
+  const {
+    rawInput,
+    accessToken,
+    refreshToken,
+    clientId,
+    clientSecret,
+    userEmail,
+    userName,
+    chatId,
+    folderName,
+  } = req.body || {};
+
+  let parsedAccess = typeof accessToken === 'string' ? accessToken.trim() : '';
+  let parsedRefresh = typeof refreshToken === 'string' ? refreshToken.trim() : '';
+  let parsedClientId = typeof clientId === 'string' ? clientId.trim() : '';
+  let parsedClientSecret = typeof clientSecret === 'string' ? clientSecret.trim() : '';
+  let parsedEmail = typeof userEmail === 'string' ? userEmail.trim() : '';
+  let parsedName = typeof userName === 'string' ? userName.trim() : '';
+  let parsedChatId = Number(chatId) || undefined;
+  let parsedFolderName = typeof folderName === 'string' && folderName.trim() ? folderName.trim() : undefined;
+
+  const text = typeof rawInput === 'string' ? rawInput.trim() : '';
+  if (text) {
+    if (text.startsWith('{') && text.endsWith('}')) {
+      try {
+        const obj = JSON.parse(text);
+        if (obj.access_token) parsedAccess = String(obj.access_token).trim();
+        if (obj.refresh_token) parsedRefresh = String(obj.refresh_token).trim();
+        if (obj.client_id) parsedClientId = String(obj.client_id).trim();
+        if (obj.client_secret) parsedClientSecret = String(obj.client_secret).trim();
+      } catch {
+        // Ignore JSON parse error
+      }
+    } else if (text.startsWith('TD1_')) {
+      try {
+        const decoded = JSON.parse(Buffer.from(text.slice(4), 'base64url').toString('utf8'));
+        if (decoded.t) parsedAccess = String(decoded.t).trim();
+        if (decoded.r) parsedRefresh = String(decoded.r).trim();
+        if (decoded.e && !parsedEmail) parsedEmail = String(decoded.e).trim();
+        if (decoded.n && !parsedName) parsedName = String(decoded.n).trim();
+        if (decoded.c && !parsedChatId) parsedChatId = Number(decoded.c) || undefined;
+        if (decoded.fn && !parsedFolderName) parsedFolderName = String(decoded.fn).trim();
+      } catch {
+        // Ignore TD1 decode error
+      }
+    } else if (text.startsWith('1//')) {
+      parsedRefresh = text;
+    } else if (text.startsWith('ya29.')) {
+      parsedAccess = text;
+    }
+  }
+
+  if (!parsedAccess && !parsedRefresh) {
+    res.status(400).json({
+      error:
+        'يرجى لصق رمز التحديث الدائم (Refresh Token يبدأ بـ 1//04...) أو رمز الوصول (Access Token يبدأ بـ ya29...) أو كود الجلسة (TD1_...).',
+    });
+    return;
+  }
+
+  const tempProf: UserDriveProfile = getOrCreateUserProfile({
+    email: parsedEmail || undefined,
+    chatId: parsedChatId,
+  });
+  if (parsedRefresh) tempProf.refreshToken = parsedRefresh;
+  if (parsedClientId) tempProf.customClientId = parsedClientId;
+  if (parsedClientSecret) tempProf.customClientSecret = parsedClientSecret;
+
+  if (parsedRefresh && !parsedAccess) {
+    const refreshed = await refreshUserDriveToken(tempProf);
+    if (!refreshed) {
+      res.status(400).json({
+        error:
+          'تعذر توليد جلسة نشطة من رمز التحديث (Refresh Token). تأكد من نسخ الـ Refresh Token كاملاً من Google OAuth Playground مع تفعيل صلاحية Drive API.',
+      });
+      return;
+    }
+    parsedAccess = refreshed;
+  }
+
+  // Verify access token against Google Drive or OAuth2 userinfo
+  try {
+    const aboutRes = await fetch(
+      'https://www.googleapis.com/drive/v3/about?fields=user(displayName,emailAddress)',
+      { headers: { Authorization: `Bearer ${parsedAccess}` } }
+    );
+    if (aboutRes.ok) {
+      const aboutData = await aboutRes.json();
+      if (aboutData?.user?.emailAddress) {
+        parsedEmail = String(aboutData.user.emailAddress).trim();
+      }
+      if (!parsedName && aboutData?.user?.displayName) {
+        parsedName = String(aboutData.user.displayName).trim();
+      }
+    } else if (parsedRefresh) {
+      // Try refreshing if provided accessToken was expired
+      const refreshed = await refreshUserDriveToken(tempProf);
+      if (refreshed) {
+        parsedAccess = refreshed;
+        const retryAbout = await fetch(
+          'https://www.googleapis.com/drive/v3/about?fields=user(displayName,emailAddress)',
+          { headers: { Authorization: `Bearer ${parsedAccess}` } }
+        );
+        if (retryAbout.ok) {
+          const retryData = await retryAbout.json();
+          if (retryData?.user?.emailAddress) parsedEmail = String(retryData.user.emailAddress).trim();
+          if (!parsedName && retryData?.user?.displayName) parsedName = String(retryData.user.displayName).trim();
+        }
+      } else {
+        res.status(401).json({
+          error: 'الرمز المدخل منتهي الصلاحية أو غير صالح للوصول إلى Google Drive.',
+        });
+        return;
+      }
+    } else {
+      res.status(401).json({
+        error: 'رمز الوصول (Access Token) منتهي الصلاحية أو غير صالح. يرجى توليد رمز جديد أو استخدام Refresh Token.',
+      });
+      return;
+    }
+  } catch (err: any) {
+    res.status(400).json({ error: err?.message || 'تعذر التحقق من حساب Google Drive.' });
+    return;
+  }
+
+  const finalProf = getOrCreateUserProfile({
+    email: parsedEmail || undefined,
+    chatId: parsedChatId,
+  });
+  finalProf.accessToken = parsedAccess;
+  finalProf.tokenExpired = false;
+  finalProf.tokenExpiresAt = tempProf.tokenExpiresAt || Date.now() + 3500 * 1000;
+  if (parsedRefresh) finalProf.refreshToken = parsedRefresh;
+  if (parsedClientId) finalProf.customClientId = parsedClientId;
+  if (parsedClientSecret) finalProf.customClientSecret = parsedClientSecret;
+  if (parsedEmail) finalProf.userEmail = parsedEmail;
+  if (parsedName) finalProf.userName = parsedName;
+  if (parsedChatId) finalProf.chatId = parsedChatId;
+  finalProf.lastSyncedAt = new Date().toISOString();
+
+  if (parsedEmail) {
+    userProfiles[parsedEmail.toLowerCase()] = finalProf;
+  }
+
+  const targetFolder = parsedFolderName || finalProf.activeFolderName || 'Telegram Bot Uploads';
+  try {
+    const folder = await ensureDriveFolder(parsedAccess, targetFolder);
+    finalProf.activeFolderId = folder.id;
+    finalProf.activeFolderName = folder.name;
+  } catch {
+    finalProf.activeFolderId = 'root';
+    finalProf.activeFolderName = 'My Drive (الرئيسي)';
+  }
+
+  if (!adminConfig.ownerChatId || !driveSession.accessToken || finalProf.chatId === adminConfig.ownerChatId) {
+    driveSession.accessToken = finalProf.accessToken;
+    driveSession.refreshToken = finalProf.refreshToken || null;
+    driveSession.tokenExpiresAt = finalProf.tokenExpiresAt || null;
+    driveSession.userEmail = finalProf.userEmail;
+    driveSession.userName = finalProf.userName;
+    driveSession.activeFolderId = finalProf.activeFolderId;
+    driveSession.activeFolderName = finalProf.activeFolderName;
+    driveSession.lastSyncedAt = finalProf.lastSyncedAt;
+  }
+
+  saveStateToDisk();
+  processPendingQueue(finalProf.chatId || undefined, finalProf.userEmail || undefined).catch(() => {});
+
+  res.json({
+    ok: true,
+    accessToken: finalProf.accessToken,
+    tokenExpiresAt: finalProf.tokenExpiresAt,
+    hasRefreshToken: Boolean(finalProf.refreshToken),
+    userEmail: finalProf.userEmail,
+    userName: finalProf.userName,
+    activeFolderId: finalProf.activeFolderId,
+    activeFolderName: finalProf.activeFolderName,
+    linkCode: finalProf.linkCode,
+    linkedChatId: finalProf.chatId || null,
+  });
+});
+
 app.post('/api/drive/disconnect', (req, res) => {
   const ctx = resolveRequestUserContext(req);
   ctx.profile.accessToken = null;
+  ctx.profile.refreshToken = null;
+  ctx.profile.tokenExpiresAt = null;
+  ctx.profile.tokenExpired = false;
   if (!adminConfig.ownerChatId || ctx.chatId === adminConfig.ownerChatId || ctx.userEmail === driveSession.userEmail) {
     driveSession.accessToken = null;
+    driveSession.refreshToken = null;
+    driveSession.tokenExpiresAt = null;
     driveSession.userEmail = null;
     driveSession.userName = null;
   }
@@ -8274,6 +8909,326 @@ app.post('/api/telegram/send-drive-file', async (req, res) => {
     await executePullToTelegramJob(job);
   } else {
     executePullToTelegramJob(job);
+  }
+
+  res.json({ ok: true, job });
+});
+
+// ============================================================================
+// Chunked Local File Upload -> Direct to Telegram (Up to 2,000 MB / 2 GB)
+// ============================================================================
+interface WebToTelegramUploadState {
+  jobId: string;
+  tempFilePath: string;
+  fileName: string;
+  mimeType: string;
+  totalBytes: number;
+  receivedBytes: number;
+  chatId: number;
+  statusMessageId?: number;
+  startTime: number;
+  lastTgEditTime: number;
+}
+
+const webToTelegramUploads = new Map<string, WebToTelegramUploadState>();
+
+app.post('/api/telegram/upload-init', async (req, res) => {
+  const ctx = resolveRequestUserContext(req);
+  const { fileName, mimeType, totalBytes, targetChatId } = req.body || {};
+
+  if (!getBotToken()) {
+    res.status(400).json({
+      error: 'يرجى إدخال وتفعيل توكن بوت تليجرام (TELEGRAM_BOT_TOKEN) من إعدادات البوت أولاً.',
+    });
+    return;
+  }
+
+  const resolvedChatId =
+    Number(targetChatId) ||
+    ctx.chatId ||
+    ctx.profile.chatId ||
+    adminConfig.ownerChatId ||
+    Object.values(adminConfig.knownUsers)[0]?.chatId ||
+    transferJobs.find((j) => j.chatId)?.chatId;
+
+  if (!resolvedChatId) {
+    res.status(400).json({
+      error:
+        'يرجى ربط حسابك في تليجرام أولاً عبر زر "ربط حسابي في تليجرام" أو إرسال /start للبوت في تليجرام لتحديد المحادثة المستلمة.',
+    });
+    return;
+  }
+
+  const cleanFileName = (typeof fileName === 'string' && fileName.trim() ? fileName.trim() : `file_${Date.now()}`).replace(
+    /[\\/:*?"<>|\r\n]+/g,
+    '_'
+  );
+  const parsedTotalBytes = Math.max(0, Number(totalBytes) || 0);
+  if (parsedTotalBytes > 2000 * 1024 * 1024) {
+    res.status(400).json({
+      error: 'حجم الملف يتجاوز الحد الأقصى المسموح به في تليجرام (2,000 MB / 2 GB).',
+    });
+    return;
+  }
+
+  const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const safeTmpName = cleanFileName.replace(/[^a-zA-Z0-9._\u0600-\u06FF-]/g, '_');
+  const tempFilePath = path.join('/tmp', `web_tg_${jobId}_${safeTmpName}`);
+
+  try {
+    fs.writeFileSync(tempFilePath, Buffer.alloc(0));
+  } catch (err: any) {
+    res.status(500).json({ error: `تعذر تهيئة ملف الرفع المؤقت: ${err?.message || ''}` });
+    return;
+  }
+
+  let statusMsgId: number | undefined;
+  try {
+    statusMsgId = await sendTelegramMessage(
+      resolvedChatId,
+      `📤 <b>جاري رفع ملف من جهازك عبر لوحة التحكم لإرساله إلى تليجرام...</b>\n` +
+        `📄 <b>الملف:</b> <code>${cleanFileName}</code>\n` +
+        `📦 <b>الحجم الكلي:</b> ${formatBytes(parsedTotalBytes)}`,
+      undefined,
+      {
+        inline_keyboard: [[{ text: '⛔ إلغاء رفع الملف', callback_data: `cancel_${jobId}` }]],
+      }
+    );
+  } catch {
+    // Ignore optional status notification error
+  }
+
+  const job: TransferJob = {
+    id: jobId,
+    source: 'web',
+    direction: 'to_telegram',
+    protocol: parsedTotalBytes > 49 * 1024 * 1024 ? 'mtproto' : 'bot_api',
+    fileName: cleanFileName,
+    mimeType: typeof mimeType === 'string' && mimeType ? mimeType : 'application/octet-stream',
+    totalBytes: parsedTotalBytes,
+    bytesTransferred: 0,
+    speedBps: 0,
+    status: 'uploading',
+    senderName: ctx.session.userName || 'رفع مباشر من المتصفح إلى تليجرام',
+    accountEmail: ctx.session.userEmail || 'default',
+    chatId: resolvedChatId,
+    statusMessageId: statusMsgId,
+    createdAt: new Date().toISOString(),
+  };
+
+  const abortController = new AbortController();
+  jobAbortControllers.set(jobId, abortController);
+
+  webToTelegramUploads.set(jobId, {
+    jobId,
+    tempFilePath,
+    fileName: cleanFileName,
+    mimeType: job.mimeType,
+    totalBytes: parsedTotalBytes,
+    receivedBytes: 0,
+    chatId: resolvedChatId,
+    statusMessageId: statusMsgId,
+    startTime: Date.now(),
+    lastTgEditTime: Date.now(),
+  });
+
+  transferJobs.unshift(job);
+  saveStateToDisk();
+
+  res.json({ ok: true, jobId, chatId: resolvedChatId, job });
+});
+
+app.post(
+  '/api/telegram/upload-chunk',
+  express.raw({ type: 'application/octet-stream', limit: '30mb' }),
+  async (req, res) => {
+    const jobId = typeof req.query.jobId === 'string' ? req.query.jobId.trim() : '';
+    const uploadState = webToTelegramUploads.get(jobId);
+    const job = transferJobs.find((j) => j.id === jobId);
+
+    if (!uploadState || !job) {
+      res.status(404).json({ error: 'جلسة رفع الملف غير موجودة أو انتهت صلاحيتها.' });
+      return;
+    }
+
+    const abortCtrl = jobAbortControllers.get(jobId);
+    if ((job.status as string) === 'cancelled' || abortCtrl?.signal.aborted) {
+      if (fs.existsSync(uploadState.tempFilePath)) {
+        try {
+          fs.unlinkSync(uploadState.tempFilePath);
+        } catch {
+          // Ignore
+        }
+      }
+      webToTelegramUploads.delete(jobId);
+      res.status(400).json({ error: 'تم إلغاء عملية الرفع.' });
+      return;
+    }
+
+    const chunkBuf = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || []);
+    if (chunkBuf.byteLength > 0) {
+      try {
+        await fs.promises.appendFile(uploadState.tempFilePath, chunkBuf);
+      } catch (err: any) {
+        res.status(500).json({ error: `فشل كتابة جزء الملف: ${err?.message || ''}` });
+        return;
+      }
+
+      uploadState.receivedBytes += chunkBuf.byteLength;
+      job.bytesTransferred = uploadState.receivedBytes;
+      const elapsedSec = Math.max(0.2, (Date.now() - uploadState.startTime) / 1000);
+      job.speedBps = Math.round(uploadState.receivedBytes / elapsedSec);
+
+      const now = Date.now();
+      if (uploadState.statusMessageId && now - uploadState.lastTgEditTime > 2600) {
+        uploadState.lastTgEditTime = now;
+        const pct =
+          uploadState.totalBytes > 0
+            ? Math.min(99, Math.round((uploadState.receivedBytes / uploadState.totalBytes) * 100))
+            : 0;
+        editTelegramMessage(
+          uploadState.chatId,
+          uploadState.statusMessageId,
+          `📤 <b>جاري استقبال الملف من المتصفح (${pct}%)...</b>\n` +
+            `📄 <b>الملف:</b> <code>${uploadState.fileName}</code>\n` +
+            `📦 <b>المرفوع:</b> ${formatBytes(uploadState.receivedBytes)} / ${formatBytes(uploadState.totalBytes)}\n` +
+            `🚀 <b>السرعة:</b> ${formatBytes(job.speedBps)}/s`,
+          {
+            inline_keyboard: [[{ text: '⛔ إلغاء رفع الملف', callback_data: `cancel_${jobId}` }]],
+          }
+        ).catch(() => {});
+      }
+    }
+
+    res.json({
+      ok: true,
+      receivedBytes: uploadState.receivedBytes,
+      totalBytes: uploadState.totalBytes,
+    });
+  }
+);
+
+app.post('/api/telegram/upload-complete', async (req, res) => {
+  const { jobId } = req.body || {};
+  const cleanJobId = typeof jobId === 'string' ? jobId.trim() : '';
+  const uploadState = webToTelegramUploads.get(cleanJobId);
+  const job = transferJobs.find((j) => j.id === cleanJobId);
+
+  if (!uploadState || !job) {
+    res.status(404).json({ error: 'لم يتم العثور على جلسة الرفع لإتمامها.' });
+    return;
+  }
+
+  const abortCtrl = jobAbortControllers.get(cleanJobId) || new AbortController();
+  jobAbortControllers.set(cleanJobId, abortCtrl);
+  const { signal } = abortCtrl;
+
+  const finalizeToTelegram = async () => {
+    try {
+      if (!fs.existsSync(uploadState.tempFilePath)) {
+        throw new Error('ملف الرفع المؤقت غير موجود.');
+      }
+      const stat = fs.statSync(uploadState.tempFilePath);
+      job.totalBytes = stat.size;
+      job.bytesTransferred = stat.size;
+      job.status = 'uploading';
+      saveStateToDisk();
+
+      const cancelKeyboard = {
+        inline_keyboard: [[{ text: '⛔ إلغاء الإرسال لتليجرام', callback_data: `cancel_${job.id}` }]],
+      };
+
+      if (uploadState.statusMessageId) {
+        await editTelegramMessage(
+          uploadState.chatId,
+          uploadState.statusMessageId,
+          `📲 <b>اكتمل استلام الملف (${formatBytes(stat.size)}) وجاري إرساله إلى محادثة تليجرام...</b>\n` +
+            `📄 <b>الملف:</b> <code>${uploadState.fileName}</code>\n` +
+            `⚡ <b>المحرك:</b> ${stat.size > 49 * 1024 * 1024 ? 'MTProto 2GB Turbo' : 'Telegram Bot API'}`,
+          cancelKeyboard
+        );
+      }
+
+      let lastTgEdit = 0;
+      const caption =
+        `📲 <b>تم رفع الملف من لوحة التحكم إلى تليجرام بنجاح!</b>\n` +
+        `📄 <b>الاسم:</b> <code>${uploadState.fileName}</code>\n` +
+        `📦 <b>الحجم:</b> ${formatBytes(stat.size)}`;
+
+      await sendLocalFileToTelegramChat(
+        uploadState.chatId,
+        uploadState.tempFilePath,
+        uploadState.fileName,
+        stat.size,
+        caption,
+        signal,
+        (pct) => {
+          const now = Date.now();
+          if (uploadState.statusMessageId && now - lastTgEdit > 2800) {
+            lastTgEdit = now;
+            editTelegramMessage(
+              uploadState.chatId,
+              uploadState.statusMessageId,
+              `📲 <b>جاري رفع الملف إلى خوادم تليجرام (${pct}%)...</b>\n` +
+                `📄 <b>الملف:</b> <code>${uploadState.fileName}</code>\n` +
+                `📦 <b>الحجم:</b> ${formatBytes(stat.size)}`,
+              cancelKeyboard
+            ).catch(() => {});
+          }
+        },
+        uploadState.statusMessageId
+      );
+
+      jobAbortControllers.delete(job.id);
+      job.status = 'completed';
+      job.completedAt = new Date().toISOString();
+      saveStateToDisk();
+
+      if (uploadState.statusMessageId) {
+        await editTelegramMessage(
+          uploadState.chatId,
+          uploadState.statusMessageId,
+          `✅ <b>اكتمل رفع وإرسال الملف إلى تليجرام بنجاح!</b>\n` +
+            `📄 <b>الملف:</b> <code>${uploadState.fileName}</code> (${formatBytes(stat.size)})`,
+          {
+            inline_keyboard: [[{ text: '🏠 القائمة الرئيسية', callback_data: 'open_main' }]],
+          }
+        );
+      }
+    } catch (err: any) {
+      jobAbortControllers.delete(job.id);
+      const rawMsg = err?.message || 'حدث خطأ أثناء إرسال الملف إلى تليجرام.';
+      if (rawMsg === 'CANCELLED_BY_USER' || signal.aborted || (job.status as string) === 'cancelled') {
+        job.status = 'cancelled';
+        job.errorMessage = 'تم إلغاء رفع الملف بناءً على طلب المستخدم.';
+      } else {
+        job.status = 'failed';
+        job.errorMessage = rawMsg;
+        if (uploadState.statusMessageId) {
+          editTelegramMessage(
+            uploadState.chatId,
+            uploadState.statusMessageId,
+            `❌ <b>تعذر إرسال الملف إلى تليجرام</b>\n📄 <code>${uploadState.fileName}</code>\n⚠️ <b>السبب:</b> ${rawMsg}`
+          ).catch(() => {});
+        }
+      }
+      saveStateToDisk();
+    } finally {
+      webToTelegramUploads.delete(cleanJobId);
+      if (fs.existsSync(uploadState.tempFilePath)) {
+        try {
+          fs.unlinkSync(uploadState.tempFilePath);
+        } catch {
+          // Ignore cleanup error
+        }
+      }
+    }
+  };
+
+  if (IS_VERCEL) {
+    await finalizeToTelegram();
+  } else {
+    void finalizeToTelegram();
   }
 
   res.json({ ok: true, job });

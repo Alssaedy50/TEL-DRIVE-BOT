@@ -12,12 +12,22 @@ export interface DriveFile {
   createdTime?: string;
 }
 
+function notifyIfUnauthorized(status: number) {
+  if (status === 401) {
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('tg-drive-token-expired'));
+    }
+    throw new Error('DRIVE_TOKEN_EXPIRED');
+  }
+}
+
 export async function listFolders(accessToken: string): Promise<DriveFolder[]> {
   const q = encodeURIComponent("mimeType = 'application/vnd.google-apps.folder' and trashed = false");
   const url = `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&orderBy=name&pageSize=100`;
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
+  notifyIfUnauthorized(res.status);
   if (!res.ok) {
     throw new Error('تعذر جلب المجلدات من Google Drive.');
   }
@@ -37,6 +47,7 @@ export async function createFolder(accessToken: string, name: string): Promise<D
       mimeType: 'application/vnd.google-apps.folder',
     }),
   });
+  notifyIfUnauthorized(res.status);
   if (!res.ok) {
     throw new Error('تعذر إنشاء المجلد الجديد في Google Drive.');
   }
@@ -49,6 +60,7 @@ export async function listFiles(accessToken: string): Promise<DriveFile[]> {
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
+  notifyIfUnauthorized(res.status);
   if (!res.ok) {
     throw new Error('تعذر جلب الملفات من Google Drive.');
   }
@@ -61,6 +73,7 @@ export async function deleteFile(accessToken: string, fileId: string): Promise<v
     method: 'DELETE',
     headers: { Authorization: `Bearer ${accessToken}` },
   });
+  notifyIfUnauthorized(res.status);
   if (!res.ok && res.status !== 204) {
     throw new Error('تعذر حذف الملف من Google Drive.');
   }
@@ -92,6 +105,7 @@ export async function startResumableUpload(
     }
   );
 
+  notifyIfUnauthorized(res.status);
   if (!res.ok) {
     throw new Error('تعذر بدء جلسة الرفع القابل للاستئناف في Google Drive.');
   }
@@ -122,6 +136,7 @@ export async function uploadChunk(
     return { done: false };
   }
 
+  notifyIfUnauthorized(res.status);
   if (res.ok) {
     const data = await res.json().catch(() => ({}));
     return { done: true, data };

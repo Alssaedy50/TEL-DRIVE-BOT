@@ -21,7 +21,7 @@ export const SCOPES = [
 
 const TOKEN_STORAGE_KEY = 'tg_drive_oauth_token';
 const TOKEN_EXPIRY_KEY = 'tg_drive_oauth_expiry';
-const TOKEN_TTL_MS = 52 * 60 * 1000; // 52 minutes
+const TOKEN_TTL_MS = 50 * 60 * 1000; // 50 minutes
 
 const provider = new GoogleAuthProvider();
 for (const scope of SCOPES) {
@@ -29,12 +29,13 @@ for (const scope of SCOPES) {
 }
 provider.setCustomParameters({
   prompt: 'select_account',
+  access_type: 'offline',
 });
 
 let isSigningIn = false;
 let cachedAccessToken: string | null = loadStoredToken();
 
-function loadStoredToken(): string | null {
+export function loadStoredToken(): string | null {
   try {
     const token = localStorage.getItem(TOKEN_STORAGE_KEY);
     const expiry = Number(localStorage.getItem(TOKEN_EXPIRY_KEY) || '0');
@@ -49,11 +50,23 @@ function loadStoredToken(): string | null {
   return null;
 }
 
-export function saveStoredToken(token: string) {
+export function getStoredTokenExpiry(): number {
+  try {
+    return Number(localStorage.getItem(TOKEN_EXPIRY_KEY) || '0');
+  } catch {
+    return 0;
+  }
+}
+
+export function saveStoredToken(token: string, customExpiresAtMs?: number) {
   cachedAccessToken = token;
   try {
+    const exp =
+      customExpiresAtMs && customExpiresAtMs > Date.now()
+        ? customExpiresAtMs
+        : Date.now() + TOKEN_TTL_MS;
     localStorage.setItem(TOKEN_STORAGE_KEY, token);
-    localStorage.setItem(TOKEN_EXPIRY_KEY, String(Date.now() + TOKEN_TTL_MS));
+    localStorage.setItem(TOKEN_EXPIRY_KEY, String(exp));
   } catch {
     // Ignore storage errors
   }

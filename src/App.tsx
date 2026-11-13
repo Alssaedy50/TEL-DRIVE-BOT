@@ -242,6 +242,8 @@ interface ServerStatus {
       username?: string;
     } | null;
     error: string | null;
+    maskedToken?: string | null;
+    hasCustomBotToken?: boolean;
     apiRoot?: string;
     isCustomApiRoot?: boolean;
     mtproto?: {
@@ -249,11 +251,16 @@ interface ServerStatus {
       connected: boolean;
       error: string | null;
       maxFileSizeLabel: string;
+      customApiId?: string;
+      hasCustomApiHash?: boolean;
     };
   };
   drive: {
     connected: boolean;
     activeAccessToken?: string | null;
+    tokenExpiresAt?: number | null;
+    hasRefreshToken?: boolean;
+    tokenExpired?: boolean;
     accountEnabled: boolean;
     userEmail: string | null;
     userName: string | null;
@@ -298,6 +305,9 @@ interface ServerStatus {
   };
   jobs: TransferJob[];
 }
+
+const OAUTH_PLAYGROUND_PRECONFIGURED_URL =
+  'https://developers.google.com/oauthplayground/#step1&apisSelect=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.file%2Chttps%3A%2F%2Fwww.googleapis.com%2Fauth%2Fuserinfo.email&url=https%3A%2F%2F&content_type=application%2Fjson&http_method=GET&useDefaultOauthCred=checked';
 
 async function parseJsonResponse<T = any>(res: Response, fallbackErrorMsg = 'تعذر إتمام العملية'): Promise<T> {
   const text = await res.text();
@@ -357,6 +367,17 @@ export default function App() {
   const [copiedSessionCode, setCopiedSessionCode] = useState(false);
   const [magicLoginUrlResult, setMagicLoginUrlResult] = useState<string | null>(null);
 
+  // In-App Telegram Bot Token & MTProto Configuration state
+  const [botTokenInput, setBotTokenInput] = useState('');
+  const [botApiIdInput, setBotApiIdInput] = useState('');
+  const [botApiHashInput, setBotApiHashInput] = useState('');
+  const [savingBotConfig, setSavingBotConfig] = useState(false);
+
+  // Direct / Permanent Refresh Token Linking state (bypasses 403 access_denied & enables 24/7 renewal)
+  const [directTokenInput, setDirectTokenInput] = useState('');
+  const [connectingDirectToken, setConnectingDirectToken] = useState(false);
+  const [showOAuth403Guide, setShowOAuth403Guide] = useState(false);
+
   // Google OAuth state
   const [accessToken, setAccessToken] = useState<string | null>(null);
   const [userProfile, setUserProfile] = useState<{ name: string; email: string; picture?: string } | null>(null);
@@ -387,10 +408,13 @@ export default function App() {
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [copiedLinkCode, setCopiedLinkCode] = useState(false);
 
-  // Direct Web Resumable Upload state (for local multi-GB files)
+  // Direct Web Resumable Upload state (for local multi-GB files to Drive, Telegram, or Both)
   const [uploadingLocal, setUploadingLocal] = useState(false);
   const [localUploadProgress, setLocalUploadProgress] = useState(0);
   const [localUploadFileName, setLocalUploadFileName] = useState('');
+  const [localUploadDestination, setLocalUploadDestination] = useState<'drive' | 'telegram' | 'both'>('drive');
+  const [localUploadStageLabel, setLocalUploadStageLabel] = useState('');
+  const localUploadAbortRef = useRef<AbortController | null>(null);
 
   // PWA Install & Connectivity state
   const { isInstallable, isInstalled, isIOS, isOnline, install: triggerPwaInstall } = usePWAInstall();
@@ -454,10 +478,29 @@ export default function App() {
     [personalEmail, personalChatId]
   );
 
+  // Listen for 401 token expiration events from googleDrive.ts service
+  useEffect(() => {
+    const handleTokenExpired = () => {
+      clearStoredToken();
+      setAccessToken(null);
+      fetch(`/api/drive/disconnect${buildIdentityQuery()}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userEmail: personalEmail, chatId: personalChatId }),
+      }).catch(() => {});
+    };
+    window.addEventListener('tg-drive-token-expired', handleTokenExpired);
+    return () => window.removeEventListener('tg-drive-token-expired', handleTokenExpired);
+  }, [buildIdentityQuery, personalEmail, personalChatId]);
+
   // Poll backend status
   const fetchStatus = useCallback(async () => {
     try {
-      const res = await fetch(`/api/status${buildIdentityQuery()}`);
+      const headers: Record<string, string> = {};
+      if (accessToken) {
+        headers.Authorization = `Bearer ${accessToken}`;
+      }
+      const res = await fetch(`/api/status${buildIdentityQuery()}`, { headers });
       if (!res.ok) return;
       const data: ServerStatus = await res.json();
       setServerStatus(data);
@@ -476,27 +519,43 @@ export default function App() {
         setPersonalChatId(cid);
         localStorage.setItem(STORAGE_CHAT_ID_KEY, cid);
       }
+      if (data.bot.mtproto?.customApiId && !botApiIdInput) {
+        setBotApiIdInput(data.bot.mtproto.customApiId);
+      }
+
+      // If server invalidated an expired token and has no refresh token, clear stale client token
+      if (data.drive.tokenExpired && accessToken && !data.drive.activeAccessToken) {
+        clearStoredToken();
+        setAccessToken(null);
+        return;
+      }
+
+      // If server refreshed the token via Refresh Token, update client token seamlessly
       if (
         data.drive.connected &&
+        !data.drive.tokenExpired &&
         data.drive.activeAccessToken &&
-        !accessToken &&
+        data.drive.activeAccessToken !== accessToken &&
         localStorage.getItem('tg_drive_logged_out') !== '1'
       ) {
-        setAccessToken(data.drive.activeAccessToken);
-        saveStoredToken(data.drive.activeAccessToken);
-        if (data.drive.userEmail && !personalEmail) {
-          setPersonalEmail(data.drive.userEmail);
-          localStorage.setItem(STORAGE_EMAIL_KEY, data.drive.userEmail);
-        }
-        if (data.drive.userName && !personalName) {
-          setPersonalName(data.drive.userName);
-          localStorage.setItem(STORAGE_NAME_KEY, data.drive.userName);
+        const expiresAt = data.drive.tokenExpiresAt || undefined;
+        if (!expiresAt || expiresAt > Date.now() + 60000) {
+          setAccessToken(data.drive.activeAccessToken);
+          saveStoredToken(data.drive.activeAccessToken, expiresAt);
+          if (data.drive.userEmail && !personalEmail) {
+            setPersonalEmail(data.drive.userEmail);
+            localStorage.setItem(STORAGE_EMAIL_KEY, data.drive.userEmail);
+          }
+          if (data.drive.userName && !personalName) {
+            setPersonalName(data.drive.userName);
+            localStorage.setItem(STORAGE_NAME_KEY, data.drive.userName);
+          }
         }
       }
     } catch {
       // Ignore transient poll errors
     }
-  }, [buildIdentityQuery, selectedFolderId, personalChatId, accessToken, personalEmail, personalName]);
+  }, [buildIdentityQuery, selectedFolderId, personalChatId, accessToken, personalEmail, personalName, botApiIdInput]);
 
   useEffect(() => {
     fetchStatus();
@@ -529,15 +588,25 @@ export default function App() {
           scope: `${SCOPES} https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/userinfo.email`,
           callback: async (tokenResponse: any) => {
             if (tokenResponse.error) {
+              if (String(tokenResponse.error).includes('access_denied')) {
+                setShowOAuth403Guide(true);
+                setActiveModal('settings');
+                setBannerError(
+                  'ظهر خطأ 403 (access_denied) لأن تطبيق Google Cloud في وضع الاختبار (Testing). يمكنك تفعيل حسابك فوراً عبر "الربط الدائم 24/7 (Refresh Token)" بالأسفل أو نشر التطبيق بضغطة واحدة!'
+                );
+                return;
+              }
               setBannerError(`فشل تسجيل الدخول إلى Google: ${tokenResponse.error}`);
               return;
             }
             const token = tokenResponse.access_token;
-            saveStoredToken(token);
+            const expiresInSec = Number(tokenResponse.expires_in) || 3500;
+            saveStoredToken(token, Date.now() + expiresInSec * 1000);
             setAccessToken(token);
             setUnauthorizedDomainHost(null);
+            setShowOAuth403Guide(false);
             setBannerError(null);
-            await onGoogleAuthenticated(token);
+            await onGoogleAuthenticated(token, undefined, expiresInSec);
           },
         });
       };
@@ -566,7 +635,8 @@ export default function App() {
     folderId?: string,
     folderName?: string,
     categorizeOverride?: boolean,
-    dedupOverride?: boolean
+    dedupOverride?: boolean,
+    expiresInSec?: number
   ) => {
     const res = await fetch('/api/drive/sync', {
       method: 'POST',
@@ -582,6 +652,7 @@ export default function App() {
         folderName: folderName || selectedFolderName || 'Telegram Bot Uploads',
         autoCategorize: categorizeOverride !== undefined ? categorizeOverride : autoCategorize,
         deduplicate: dedupOverride !== undefined ? dedupOverride : skipDuplicates,
+        expiresInSec,
       }),
     });
     const data = await parseJsonResponse(res, 'تعذر مزامنة جلسة حسابك مع الخادم.');
@@ -590,7 +661,8 @@ export default function App() {
 
   const onGoogleAuthenticated = async (
     token: string,
-    knownProfile?: { name?: string; email?: string; picture?: string }
+    knownProfile?: { name?: string; email?: string; picture?: string },
+    expiresInSec?: number
   ) => {
     try {
       localStorage.removeItem('tg_drive_logged_out');
@@ -637,7 +709,16 @@ export default function App() {
         }
       }
 
-      const syncData = await syncTokenWithServer(token, email, name);
+      const syncData = await syncTokenWithServer(
+        token,
+        email,
+        name,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        expiresInSec
+      );
       const finalEmail = email || syncData.userEmail || '';
       const finalName = (name !== 'مستخدم Google Drive' ? name : syncData.userName) || name;
 
@@ -677,42 +758,106 @@ export default function App() {
     }
   };
 
+  const handleSaveBotConfig = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    setSavingBotConfig(true);
+    setBannerError(null);
+    try {
+      const res = await fetch('/api/bot/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          botToken: botTokenInput.trim() || undefined,
+          apiId: botApiIdInput.trim() || undefined,
+          apiHash: botApiHashInput.trim() || undefined,
+        }),
+      });
+      const data = await parseJsonResponse(res, 'تعذر حفظ إعدادات البوت.');
+      setBotTokenInput('');
+      setBotApiHashInput('');
+      await fetchStatus();
+      setBannerSuccess(
+        data.info?.username
+          ? `تم حفظ وتفعيل بوت تليجرام (@${data.info.username}) بنجاح!`
+          : 'تم حفظ إعدادات البوت وتنشيط الاتصال بنجاح!'
+      );
+      setTimeout(() => setBannerSuccess(null), 5000);
+    } catch (err: any) {
+      setBannerError(err?.message || 'تعذر التحقق من توكن البوت.');
+    } finally {
+      setSavingBotConfig(false);
+    }
+  };
+
+  const handleConnectDirectDriveToken = async (e?: React.FormEvent, overrideInput?: string) => {
+    if (e) e.preventDefault();
+    const raw = (overrideInput !== undefined ? overrideInput : directTokenInput).trim();
+    if (!raw) return;
+    setConnectingDirectToken(true);
+    setBannerError(null);
+    try {
+      const res = await fetch('/api/drive/connect-token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          rawInput: raw,
+          userEmail: personalEmail || undefined,
+          userName: personalName || undefined,
+          chatId: personalChatId || undefined,
+          folderName: selectedFolderName || 'Telegram Bot Uploads',
+        }),
+      });
+      const data = await parseJsonResponse(res, 'تعذر ربط الحساب بالرمز المدخل.');
+      localStorage.removeItem('tg_drive_logged_out');
+      if (data.accessToken) {
+        saveStoredToken(data.accessToken, data.tokenExpiresAt || undefined);
+        setAccessToken(data.accessToken);
+      }
+      if (data.userEmail) {
+        setPersonalEmail(data.userEmail);
+        localStorage.setItem(STORAGE_EMAIL_KEY, data.userEmail);
+      }
+      if (data.userName) {
+        setPersonalName(data.userName);
+        localStorage.setItem(STORAGE_NAME_KEY, data.userName);
+      }
+      if (data.linkedChatId) {
+        setPersonalChatId(String(data.linkedChatId));
+        localStorage.setItem(STORAGE_CHAT_ID_KEY, String(data.linkedChatId));
+      }
+      setUserProfile({
+        name: data.userName || 'مستخدم Google Drive',
+        email: data.userEmail || '',
+      });
+      setSelectedFolderId(data.activeFolderId || '');
+      setSelectedFolderName(data.activeFolderName || 'Telegram Bot Uploads');
+      setDirectTokenInput('');
+      setSessionCodeInput('');
+      setUnauthorizedDomainHost(null);
+      setShowOAuth403Guide(false);
+      setBannerSuccess(
+        data.hasRefreshToken
+          ? `تم تفعيل الربط الدائم 24/7 لحساب (${data.userEmail || data.userName}) بنجاح! لن تنتهي صلاحية الجلسة وسيتم تجديدها تلقائياً.`
+          : `تم ربط وتنشيط حساب Google Drive (${data.userEmail || data.userName}) بنجاح!`
+      );
+      setTimeout(() => setBannerSuccess(null), 6000);
+      if (data.accessToken) {
+        await refreshDriveFoldersAndFiles(data.accessToken);
+      }
+      await fetchStatus();
+    } catch (err: any) {
+      setBannerError(err?.message || 'الرمز المدخل غير صالح أو منتهي الصلاحية.');
+    } finally {
+      setConnectingDirectToken(false);
+    }
+  };
+
   const applyPortableSessionCode = async (rawCode: string) => {
     const clean = rawCode.trim();
     if (!clean) return;
     setApplyingSessionCode(true);
-    setBannerError(null);
     try {
-      let token = clean;
-      let email = personalEmail;
-      let name = personalName || 'مستخدم Google Drive';
-      let chatId = personalChatId;
-
-      if (clean.startsWith('TD1_')) {
-        const b64 = clean.slice(4).replace(/-/g, '+').replace(/_/g, '/');
-        const binary = atob(b64);
-        const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
-        const decodedJson = JSON.parse(new TextDecoder().decode(bytes));
-        if (!decodedJson?.t) {
-          throw new Error('كود الجلسة غير صالح.');
-        }
-        token = decodedJson.t;
-        if (decodedJson.e) email = decodedJson.e;
-        if (decodedJson.n) name = decodedJson.n;
-        if (decodedJson.c) chatId = String(decodedJson.c);
-      }
-
-      if (chatId) {
-        setPersonalChatId(chatId);
-        localStorage.setItem(STORAGE_CHAT_ID_KEY, chatId);
-      }
-      saveStoredToken(token);
-      setAccessToken(token);
-      setUnauthorizedDomainHost(null);
-      setSessionCodeInput('');
-      await onGoogleAuthenticated(token, { name, email });
-    } catch (err: any) {
-      setBannerError(err?.message || 'كود الجلسة المدخل غير صالح أو منتهي الصلاحية.');
+      await handleConnectDirectDriveToken(undefined, clean);
     } finally {
       setApplyingSessionCode(false);
     }
@@ -821,7 +966,15 @@ export default function App() {
         setUnauthorizedDomainHost(currentHost);
         setActiveModal('settings');
         setBannerError(
-          `النطاق (${currentHost}) غير مضاف بعد في Google Cloud / Firebase. يمكنك الربط فوراً عبر "كود الجلسة السريع" بالأسفل بدون أي إعدادات، أو إضافة النطاق في خطوتين.`
+          `النطاق (${currentHost}) غير مضاف بعد في Google Cloud / Firebase. يمكنك الربط فوراً عبر "الربط الدائم 24/7" أو "كود الجلسة السريع" بالأسفل بدون أي إعدادات.`
+        );
+        return;
+      }
+      if (String(err?.message || '').includes('access_denied') || String(err?.code || '').includes('access-denied')) {
+        setShowOAuth403Guide(true);
+        setActiveModal('settings');
+        setBannerError(
+          'ظهر خطأ 403 (access_denied) لأن تطبيق Google Cloud في وضع الاختبار. استخدم "الربط الدائم 24/7 (Refresh Token)" بالأسفل لربط أي حساب فوراً!'
         );
         return;
       }
@@ -830,7 +983,12 @@ export default function App() {
         return;
       }
       if (err?.code !== 'auth/popup-closed-by-user') {
-        setBannerError(err?.message || 'تعذر تسجيل الدخول بحساب Google.');
+        setShowOAuth403Guide(true);
+        setActiveModal('settings');
+        setBannerError(
+          err?.message ||
+            'تعذر فتح نافذة Google المباشرة. يمكنك ربط أي حساب Google Drive فوراً وبشكل دائم من نافذة الإعدادات أدناه.'
+        );
       }
     }
   };
@@ -1714,9 +1872,127 @@ export default function App() {
     }
   };
 
+  const handleCancelLocalUpload = () => {
+    if (localUploadAbortRef.current) {
+      localUploadAbortRef.current.abort();
+      localUploadAbortRef.current = null;
+    }
+    setUploadingLocal(false);
+    setLocalUploadStageLabel('');
+    setLocalUploadFileName('');
+  };
+
+  const uploadFileToDriveChunked = async (
+    file: File,
+    signal: AbortSignal,
+    baseProgress: number,
+    progressSpan: number
+  ) => {
+    if (!accessToken) {
+      throw new Error('يرجى ربط أو تنشيط جلسة Google Drive أولاً.');
+    }
+    const targetFolder = selectedFolderId || serverStatus?.drive.activeFolderId || undefined;
+    const sessionUri = await startResumableUpload(accessToken, file, targetFolder);
+
+    const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB chunks
+    let offset = 0;
+    let finalDriveResponse: any = null;
+
+    while (offset < file.size) {
+      if (signal.aborted) throw new Error('CANCELLED_BY_USER');
+      const end = Math.min(offset + CHUNK_SIZE, file.size);
+      const chunk = file.slice(offset, end);
+      const result = await uploadChunk(sessionUri, chunk, offset, file.size);
+      offset = end;
+      const ratio = file.size > 0 ? offset / file.size : 1;
+      setLocalUploadProgress(Math.min(100, Math.round(baseProgress + ratio * progressSpan)));
+      if (result.done) {
+        finalDriveResponse = result.data;
+      }
+    }
+
+    await fetch('/api/transfers/register-web', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userEmail: personalEmail || undefined,
+        chatId: personalChatId || undefined,
+        fileName: file.name,
+        mimeType: file.type || 'application/octet-stream',
+        totalBytes: file.size,
+        driveFileId: finalDriveResponse?.id,
+        webViewLink: finalDriveResponse?.webViewLink,
+        folderName: selectedFolderName,
+      }),
+    });
+  };
+
+  const uploadFileToTelegramChunked = async (
+    file: File,
+    signal: AbortSignal,
+    baseProgress: number,
+    progressSpan: number
+  ) => {
+    const initRes = await fetch('/api/telegram/upload-init', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fileName: file.name,
+        mimeType: file.type || 'application/octet-stream',
+        totalBytes: file.size,
+        userEmail: personalEmail || undefined,
+        targetChatId: personalChatId || undefined,
+      }),
+      signal,
+    });
+    const initData = await parseJsonResponse(initRes, 'تعذر بدء رفع الملف إلى تليجرام.');
+    const jobId = initData.jobId;
+
+    const CHUNK_SIZE = 8 * 1024 * 1024; // 8MB binary chunks
+    let offset = 0;
+
+    try {
+      while (offset < file.size) {
+        if (signal.aborted) throw new Error('CANCELLED_BY_USER');
+        const end = Math.min(offset + CHUNK_SIZE, file.size);
+        const chunkBlob = file.slice(offset, end);
+        const chunkRes = await fetch(`/api/telegram/upload-chunk?jobId=${encodeURIComponent(jobId)}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: chunkBlob,
+          signal,
+        });
+        await parseJsonResponse(chunkRes, 'فشل إرسال جزء من الملف إلى الخادم.');
+        offset = end;
+        const ratio = file.size > 0 ? offset / file.size : 1;
+        setLocalUploadProgress(Math.min(98, Math.round(baseProgress + ratio * (progressSpan * 0.92))));
+      }
+
+      setLocalUploadStageLabel(
+        file.size > 49 * 1024 * 1024
+          ? 'جاري إرسال الملف الضخم إلى محادثة تليجرام عبر محرك MTProto 2GB...'
+          : 'جاري تسليم الملف إلى محادثتك في تليجرام...'
+      );
+      const completeRes = await fetch('/api/telegram/upload-complete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobId }),
+        signal,
+      });
+      await parseJsonResponse(completeRes, 'تعذر إتمام إرسال الملف إلى تليجرام.');
+      setLocalUploadProgress(Math.min(100, Math.round(baseProgress + progressSpan)));
+    } catch (err) {
+      fetch(`/api/transfers/${jobId}/cancel`, { method: 'POST' }).catch(() => {});
+      throw err;
+    }
+  };
+
   const handleDirectLargeFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file || !accessToken) return;
+    if (!file) return;
+
+    const abortController = new AbortController();
+    localUploadAbortRef.current = abortController;
 
     setUploadingLocal(true);
     setLocalUploadProgress(0);
@@ -1724,48 +2000,39 @@ export default function App() {
     setBannerError(null);
 
     try {
-      const targetFolder = selectedFolderId || serverStatus?.drive.activeFolderId || undefined;
-      const sessionUri = await startResumableUpload(accessToken, file, targetFolder);
-
-      const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB chunks
-      let offset = 0;
-      let finalDriveResponse: any = null;
-
-      while (offset < file.size) {
-        const end = Math.min(offset + CHUNK_SIZE, file.size);
-        const chunk = file.slice(offset, end);
-        const result = await uploadChunk(sessionUri, chunk, offset, file.size);
-        offset = end;
-        setLocalUploadProgress(Math.round((offset / file.size) * 100));
-        if (result.done) {
-          finalDriveResponse = result.data;
-        }
+      if (localUploadDestination === 'drive') {
+        setLocalUploadStageLabel(`جاري الرفع المقسم إلى Google Drive (${selectedFolderName})...`);
+        await uploadFileToDriveChunked(file, abortController.signal, 0, 100);
+        setBannerSuccess(`تم رفع الملف "${file.name}" (${formatBytes(file.size)}) إلى Google Drive بنجاح!`);
+        await refreshDriveFoldersAndFiles();
+      } else if (localUploadDestination === 'telegram') {
+        setLocalUploadStageLabel('جاري رفع الملف وإرساله مباشرة إلى محادثتك في تليجرام...');
+        await uploadFileToTelegramChunked(file, abortController.signal, 0, 100);
+        setBannerSuccess(
+          `تم رفع الملف "${file.name}" (${formatBytes(file.size)}) وجاري تسليمه إلى محادثتك في تليجرام!`
+        );
+      } else {
+        setLocalUploadStageLabel(`المرحلة 1/2: جاري الرفع إلى Google Drive (${selectedFolderName})...`);
+        await uploadFileToDriveChunked(file, abortController.signal, 0, 50);
+        setLocalUploadStageLabel('المرحلة 2/2: جاري رفع وإرسال نسخة إلى محادثتك في تليجرام...');
+        await uploadFileToTelegramChunked(file, abortController.signal, 50, 50);
+        setBannerSuccess(
+          `تم رفع الملف "${file.name}" إلى كل من Google Drive ومحادثتك في تليجرام بنجاح!`
+        );
+        await refreshDriveFoldersAndFiles();
       }
 
-      await fetch('/api/transfers/register-web', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          userEmail: personalEmail || undefined,
-          chatId: personalChatId || undefined,
-          fileName: file.name,
-          mimeType: file.type || 'application/octet-stream',
-          totalBytes: file.size,
-          driveFileId: finalDriveResponse?.id,
-          webViewLink: finalDriveResponse?.webViewLink,
-          folderName: selectedFolderName,
-        }),
-      });
-
-      setBannerSuccess(`تم رفع الملف الضخم "${file.name}" إلى حسابك في Google Drive بنجاح!`);
-      setTimeout(() => setBannerSuccess(null), 5000);
-      await refreshDriveFoldersAndFiles();
+      setTimeout(() => setBannerSuccess(null), 6000);
       fetchStatus();
     } catch (err: any) {
-      setBannerError(err?.message || 'فشل رفع الملف المحلي إلى Google Drive.');
+      if (err?.message !== 'CANCELLED_BY_USER' && !abortController.signal.aborted) {
+        setBannerError(err?.message || 'فشل رفع الملف المحلي.');
+      }
     } finally {
       setUploadingLocal(false);
       setLocalUploadFileName('');
+      setLocalUploadStageLabel('');
+      localUploadAbortRef.current = null;
       e.target.value = '';
     }
   };
@@ -1838,8 +2105,12 @@ export default function App() {
   );
 
   const botConnected = serverStatus?.bot.connected ?? false;
+  const botConfigured = serverStatus?.bot.configured ?? true;
   const mtprotoConnected = serverStatus?.bot.mtproto?.connected ?? false;
-  const driveConnected = Boolean(accessToken) || (serverStatus?.drive.connected ?? false);
+  const driveTokenExpired = Boolean(serverStatus?.drive.tokenExpired && !accessToken);
+  const driveHasRefreshToken = Boolean(serverStatus?.drive.hasRefreshToken);
+  const driveConnected =
+    !driveTokenExpired && (Boolean(accessToken) || (serverStatus?.drive.connected ?? false));
   const effectiveUserEmail = userProfile?.email || serverStatus?.drive.userEmail || personalEmail || null;
   const effectiveUserName = userProfile?.name || serverStatus?.drive.userName || personalName || null;
   const linkCode = serverStatus?.drive.linkCode || '';
@@ -1939,7 +2210,7 @@ export default function App() {
               onClick={() => setActiveModal('admin')}
               className="hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
-              إدارة البوت
+              إدارة وتوكن البوت
             </button>
           </nav>
 
@@ -1980,17 +2251,28 @@ export default function App() {
       <main className="flex-1 w-full max-w-5xl mx-auto px-3.5 sm:px-6 py-4 sm:py-6 space-y-5">
         {/* Notification Banners */}
         {bannerError && (
-          <div className="p-3.5 rounded-xl bg-rose-950/70 border border-rose-500/40 text-rose-200 flex items-center justify-between gap-3">
+          <div className="p-3.5 rounded-xl bg-rose-950/70 border border-rose-500/40 text-rose-200 flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2.5 text-xs sm:text-sm min-w-0">
               <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
               <span className="break-words">{bannerError}</span>
             </div>
-            <button
-              onClick={() => setBannerError(null)}
-              className="min-h-[36px] px-2.5 text-xs text-rose-300 hover:text-white shrink-0 cursor-pointer"
-            >
-              إغلاق
-            </button>
+            <div className="flex items-center gap-2 shrink-0">
+              {bannerError.includes('Google Drive') && (
+                <button
+                  type="button"
+                  onClick={() => setActiveModal('settings')}
+                  className="px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold cursor-pointer"
+                >
+                  تنشيط الربط الدائم 24/7
+                </button>
+              )}
+              <button
+                onClick={() => setBannerError(null)}
+                className="min-h-[36px] px-2.5 text-xs text-rose-300 hover:text-white shrink-0 cursor-pointer"
+              >
+                إغلاق
+              </button>
+            </div>
           </div>
         )}
 
@@ -2025,36 +2307,167 @@ export default function App() {
           </div>
         )}
 
-        {/* Clean Unboxed Account & Status Bar */}
-        <div className="w-full px-4 py-3 rounded-2xl bg-[#0F1626] border border-slate-800/80 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-400">
-          <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 min-w-0">
+        {/* Inline Bot Token Setup Banner (Shown whenever Bot Token is missing or disconnected) */}
+        {serverStatus && (!botConfigured || (!botConnected && serverStatus.bot.error)) && (
+          <div className="p-4 rounded-2xl bg-indigo-950/60 border border-indigo-500/40 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Bot className="w-5 h-5 text-indigo-400 shrink-0" />
+                <div>
+                  <p className="text-xs sm:text-sm font-bold text-white">
+                    إدخال وتفعيل توكن بوت تليجرام مباشرة من داخل التطبيق
+                  </p>
+                  <p className="text-[11px] text-indigo-200/80">
+                    {serverStatus.bot.error || 'أدخل توكن البوت من @BotFather لتشغيل الاستقبال والرفع الفوري لجميع المستخدمين'}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setActiveModal('admin')}
+                className="px-3 py-1.5 rounded-lg bg-slate-900/90 hover:bg-slate-800 text-indigo-300 border border-indigo-500/30 text-xs font-semibold cursor-pointer"
+              >
+                إعدادات البوت المتقدمة (2GB MTProto)
+              </button>
+            </div>
+            <form onSubmit={handleSaveBotConfig} className="flex flex-col sm:flex-row gap-2">
+              <input
+                type="text"
+                dir="ltr"
+                value={botTokenInput}
+                onChange={(e) => setBotTokenInput(e.target.value)}
+                placeholder="123456789:ABCdefGHIjklMNOpqrsTUVwxyz (توكن البوت من @BotFather)"
+                className="flex-1 px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white placeholder-slate-500 font-mono"
+              />
+              <button
+                type="submit"
+                disabled={savingBotConfig || !botTokenInput.trim()}
+                className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer shrink-0"
+              >
+                {savingBotConfig ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
+                <span>حفظ وتفعيل البوت الآن</span>
+              </button>
+            </form>
+          </div>
+        )}
+
+        {/* Expired Drive Session Alert with Instant Renewal & 24/7 Permanent Link */}
+        {driveTokenExpired && (
+          <div className="p-4 rounded-2xl bg-amber-950/60 border border-amber-500/40 flex flex-wrap items-center justify-between gap-3 text-xs">
+            <div className="space-y-1">
+              <p className="font-bold text-amber-200 text-sm flex items-center gap-1.5">
+                <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                <span>انتهت صلاحية جلسة Google Drive المؤقتة لحساب ({effectiveUserEmail})</span>
+              </p>
+              <p className="text-amber-100/80">
+                اضغط لتجديد الجلسة فوراً، أو فعّل <strong>الربط الدائم 24/7 (Refresh Token)</strong> لعدم انتهاء الصلاحية أبداً.
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={handleSignIn}
+                className="px-3.5 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-bold cursor-pointer"
+              >
+                تجديد الجلسة بضغطة واحدة
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveModal('settings')}
+                className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold cursor-pointer"
+              >
+                تفعيل الربط الدائم 24/7
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Clean Unboxed Account & Status Bar + Quick Action Buttons */}
+        <div className="w-full px-4 py-3 rounded-2xl bg-[#0F1626] border border-slate-800/80 space-y-2.5 text-xs text-slate-400">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 min-w-0">
+              <button
+                type="button"
+                onClick={() => setActiveModal('settings')}
+                className={`font-semibold hover:underline cursor-pointer ${
+                  driveConnected ? 'text-emerald-400' : 'text-amber-400'
+                }`}
+              >
+                {driveConnected
+                  ? `حساب Drive: ${effectiveUserEmail || effectiveUserName}${driveHasRefreshToken ? ' (دائم 24/7)' : ''}`
+                  : driveTokenExpired
+                  ? `حساب Drive: ${effectiveUserEmail} (يتطلب تنشيط)`
+                  : 'اضغط لربط حسابك الشخصي في Google Drive وتليجرام'}
+              </button>
+              <span aria-hidden="true">·</span>
+              <span className="truncate">
+                المجلد: <strong className="text-slate-200 font-medium">{serverStatus?.drive.activeFolderName || selectedFolderName}</strong>
+              </span>
+              <span aria-hidden="true">·</span>
+              <span>
+                تليجرام:{' '}
+                <strong className="text-slate-200 font-medium">
+                  {linkedChatId ? `مربوط (#${linkedChatId})` : 'غير مربوط'}
+                </strong>
+              </span>
+              <span aria-hidden="true">·</span>
+              <button
+                type="button"
+                onClick={() => setActiveModal('admin')}
+                className={`font-medium hover:underline cursor-pointer ${
+                  botConnected ? 'text-sky-400' : 'text-rose-400'
+                }`}
+              >
+                {botConnected && botUsername ? `البوت: @${botUsername}` : 'إعداد توكن البوت'}
+              </button>
+            </div>
+
+            <div className="flex items-center gap-2.5 tabular-nums text-slate-300">
+              <span>المكتملة: {serverStatus?.stats.completedJobs ?? 0}</span>
+              <span aria-hidden="true">·</span>
+              <span>الجارية: {serverStatus?.stats.activeJobs ?? 0}</span>
+              <span aria-hidden="true">·</span>
+              <span dir="ltr">{formatBytes(serverStatus?.stats.totalBytesTransferred ?? 0)}</span>
+            </div>
+          </div>
+
+          {/* Quick Multi-User & Large File Action Bar */}
+          <div className="pt-2 border-t border-slate-800/70 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setActiveModal('large_upload')}
+              className="px-3 py-1.5 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/30 border border-indigo-500/30 text-indigo-300 font-semibold flex items-center gap-1.5 cursor-pointer transition"
+            >
+              <UploadCloud className="w-3.5 h-3.5" />
+              <span>رفع ملف كبير (إلى تليجرام 2GB أو Google Drive)</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setActiveModal('drive_files');
+                if (accessToken) refreshDriveFoldersAndFiles();
+              }}
+              className="px-3 py-1.5 rounded-xl bg-sky-600/20 hover:bg-sky-600/30 border border-sky-500/30 text-sky-300 font-semibold flex items-center gap-1.5 cursor-pointer transition"
+            >
+              <HardDrive className="w-3.5 h-3.5" />
+              <span>سحب ملفات من Google Drive إلى تليجرام</span>
+            </button>
             <button
               type="button"
               onClick={() => setActiveModal('settings')}
-              className={`font-semibold hover:underline cursor-pointer ${
-                driveConnected ? 'text-emerald-400' : 'text-amber-400'
-              }`}
+              className="px-3 py-1.5 rounded-xl bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/30 text-emerald-300 font-semibold flex items-center gap-1.5 cursor-pointer transition"
             >
-              {driveConnected
-                ? `حساب Drive: ${effectiveUserEmail || effectiveUserName}`
-                : 'اضغط لربط حساب Google Drive وتليجرام'}
+              <User className="w-3.5 h-3.5" />
+              <span>ربط حساب Google Drive (متعدد المستخدمين 24/7)</span>
             </button>
-            <span aria-hidden="true">·</span>
-            <span className="truncate">
-              المجلد: <strong className="text-slate-200 font-medium">{serverStatus?.drive.activeFolderName || selectedFolderName}</strong>
-            </span>
-            <span aria-hidden="true">·</span>
-            <span>
-              تليجرام: <strong className="text-slate-200 font-medium">{linkedChatId ? `مربوط (#${linkedChatId})` : 'غير مربوط'}</strong>
-            </span>
-          </div>
-
-          <div className="flex items-center gap-2.5 tabular-nums text-slate-300">
-            <span>المكتملة: {serverStatus?.stats.completedJobs ?? 0}</span>
-            <span aria-hidden="true">·</span>
-            <span>الجارية: {serverStatus?.stats.activeJobs ?? 0}</span>
-            <span aria-hidden="true">·</span>
-            <span dir="ltr">{formatBytes(serverStatus?.stats.totalBytesTransferred ?? 0)}</span>
+            <button
+              type="button"
+              onClick={() => setActiveModal('admin')}
+              className="px-3 py-1.5 rounded-xl bg-amber-600/20 hover:bg-amber-600/30 border border-amber-500/30 text-amber-300 font-semibold flex items-center gap-1.5 cursor-pointer transition"
+            >
+              <Bot className="w-3.5 h-3.5" />
+              <span>إدخال/تغيير توكن البوت</span>
+            </button>
           </div>
         </div>
 
@@ -3382,55 +3795,168 @@ export default function App() {
                 </div>
               )}
 
-              {/* MODAL 3: LARGE LOCAL FILE UPLOAD */}
+              {/* MODAL 3: LARGE LOCAL FILE UPLOAD (TO GOOGLE DRIVE, TELEGRAM, OR BOTH) */}
               {activeModal === 'large_upload' && (
                 <div className="space-y-4">
-                  <p className="text-xs text-slate-400">
-                    رفع مباشر مقسم (Resumable Chunked Upload) من متصفحك إلى حسابك الشخصي في Google Drive لأي حجم (1GB أو 10GB+).
+                  <p className="text-xs text-slate-400 leading-relaxed">
+                    رفع مباشر مقسم (Chunked Upload) للملفات الكبيرة بمختلف أحجامها من جهازك إلى{' '}
+                    <strong className="text-sky-300">حسابك في Google Drive</strong> (حتى 10GB+) أو إلى{' '}
+                    <strong className="text-indigo-300">محادثتك في تليجرام</strong> (حتى 2,000MB / 2GB عبر محرك MTProto) أو لكليهما معاً.
                   </p>
 
-                  {!accessToken ? (
-                    <div className="p-8 rounded-xl bg-slate-900/60 border border-slate-800 text-center space-y-3">
-                      <p className="text-sm text-slate-300">يرجى تسجيل الدخول بحسابك في Google Drive أولاً لتفعيل الرفع المباشر.</p>
+                  {/* Upload Destination Selector */}
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    <button
+                      type="button"
+                      disabled={uploadingLocal}
+                      onClick={() => setLocalUploadDestination('drive')}
+                      className={`p-3 rounded-xl border text-right transition cursor-pointer ${
+                        localUploadDestination === 'drive'
+                          ? 'bg-sky-500/15 border-sky-500/50 text-sky-200 font-bold'
+                          : 'bg-slate-900/60 border-slate-800 text-slate-400 hover:border-slate-700'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2 text-xs">
+                        <HardDrive className="w-4 h-4 text-sky-400 shrink-0" />
+                        <span>إلى Google Drive</span>
+                      </div>
+                      <p className="text-[11px] text-slate-400 mt-1">رفع مقسم لأي حجم (10GB+)</p>
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={uploadingLocal}
+                      onClick={() => setLocalUploadDestination('telegram')}
+                      className={`p-3 rounded-xl border text-right transition cursor-pointer ${
+                        localUploadDestination === 'telegram'
+                          ? 'bg-indigo-500/15 border-indigo-500/50 text-indigo-200 font-bold'
+                          : 'bg-slate-900/60 border-slate-800 text-slate-400 hover:border-slate-700'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2 text-xs">
+                        <Send className="w-4 h-4 text-indigo-400 shrink-0" />
+                        <span>إلى بوت تليجرام</span>
+                      </div>
+                      <p className="text-[11px] text-slate-400 mt-1">حتى 2GB عبر MTProto Turbo</p>
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={uploadingLocal}
+                      onClick={() => setLocalUploadDestination('both')}
+                      className={`p-3 rounded-xl border text-right transition cursor-pointer ${
+                        localUploadDestination === 'both'
+                          ? 'bg-emerald-500/15 border-emerald-500/50 text-emerald-200 font-bold'
+                          : 'bg-slate-900/60 border-slate-800 text-slate-400 hover:border-slate-700'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2 text-xs">
+                        <UploadCloud className="w-4 h-4 text-emerald-400 shrink-0" />
+                        <span>إلى Drive وتليجرام معاً</span>
+                      </div>
+                      <p className="text-[11px] text-slate-400 mt-1">نسخة سحابية + نسخة بتليجرام</p>
+                    </button>
+                  </div>
+
+                  {(localUploadDestination === 'drive' || localUploadDestination === 'both') && !accessToken ? (
+                    <div className="p-6 rounded-xl bg-slate-900/60 border border-slate-800 text-center space-y-3">
+                      <p className="text-sm text-slate-300">
+                        يرجى ربط حسابك في Google Drive أولاً لتفعيل الرفع إلى Drive (أو اختر "إلى بوت تليجرام" بالأعلى).
+                      </p>
+                      <div className="flex flex-wrap items-center justify-center gap-2">
+                        <button
+                          onClick={handleSignIn}
+                          className="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-semibold text-xs transition cursor-pointer"
+                        >
+                          تسجيل الدخول بـ Google
+                        </button>
+                        <button
+                          onClick={() => setActiveModal('settings')}
+                          className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs transition cursor-pointer"
+                        >
+                          الربط الدائم 24/7 (Refresh Token)
+                        </button>
+                      </div>
+                    </div>
+                  ) : (localUploadDestination === 'telegram' || localUploadDestination === 'both') && !linkedChatId ? (
+                    <div className="p-6 rounded-xl bg-slate-900/60 border border-slate-800 text-center space-y-3">
+                      <p className="text-sm text-slate-300">
+                        لإرسال الملف إلى محادثتك في تليجرام، يرجى ربط محادثة تليجرام أولاً عبر البوت.
+                      </p>
                       <button
-                        onClick={handleSignIn}
-                        className="px-5 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-semibold text-xs transition cursor-pointer"
+                        onClick={() => setActiveModal('settings')}
+                        className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs transition cursor-pointer"
                       >
-                        تسجيل الدخول بـ Google
+                        ربط محادثة تليجرام الآن
                       </button>
                     </div>
                   ) : (
-                    <label className="block border-2 border-dashed border-slate-700 hover:border-indigo-500/60 rounded-2xl p-8 sm:p-10 text-center cursor-pointer transition bg-slate-900/40">
-                      <input
-                        type="file"
-                        className="hidden"
-                        disabled={uploadingLocal}
-                        onChange={handleDirectLargeFileUpload}
-                      />
-                      {uploadingLocal ? (
-                        <div className="space-y-3 max-w-md mx-auto">
-                          <div className="flex items-center justify-between text-xs text-indigo-300 font-semibold">
-                            <span className="truncate">{localUploadFileName}</span>
-                            <span className="tabular-nums">{localUploadProgress}%</span>
+                    <div className="space-y-3">
+                      <label className="block border-2 border-dashed border-slate-700 hover:border-indigo-500/60 rounded-2xl p-8 sm:p-10 text-center cursor-pointer transition bg-slate-900/40">
+                        <input
+                          type="file"
+                          className="hidden"
+                          disabled={uploadingLocal}
+                          onChange={handleDirectLargeFileUpload}
+                        />
+                        {uploadingLocal ? (
+                          <div className="space-y-3 max-w-md mx-auto">
+                            <div className="flex items-center justify-between text-xs text-indigo-300 font-semibold">
+                              <span className="truncate">{localUploadFileName}</span>
+                              <span className="tabular-nums">{localUploadProgress}%</span>
+                            </div>
+                            <div className="w-full h-2.5 bg-slate-800 rounded-full overflow-hidden">
+                              <div
+                                className="h-full bg-indigo-500 transition-all duration-200"
+                                style={{ width: `${localUploadProgress}%` }}
+                              />
+                            </div>
+                            <p className="text-xs text-slate-300">
+                              {localUploadStageLabel || 'جاري رفع الملف...'}
+                            </p>
                           </div>
-                          <div className="w-full h-2.5 bg-slate-800 rounded-full overflow-hidden">
-                            <div
-                              className="h-full bg-indigo-500 transition-all duration-200"
-                              style={{ width: `${localUploadProgress}%` }}
-                            />
+                        ) : (
+                          <div className="space-y-2">
+                            <UploadCloud className="w-10 h-10 text-indigo-400 mx-auto" />
+                            <p className="text-sm font-bold text-white">
+                              اضغط هنا لاختيار أي ملف كبير أو صغير من جهازك
+                            </p>
+                            <p className="text-xs text-slate-400">
+                              {localUploadDestination === 'drive' && (
+                                <>
+                                  سيتم رفعه مباشرة إلى مجلد:{' '}
+                                  <strong className="text-emerald-300">{selectedFolderName}</strong>
+                                </>
+                              )}
+                              {localUploadDestination === 'telegram' && (
+                                <>
+                                  سيتم إرساله مباشرة إلى محادثتك في تليجرام{' '}
+                                  <strong className="text-indigo-300">(#{linkedChatId})</strong>
+                                </>
+                              )}
+                              {localUploadDestination === 'both' && (
+                                <>
+                                  سيتم حفظه في مجلد <strong className="text-emerald-300">{selectedFolderName}</strong>{' '}
+                                  وإرسال نسخة إلى تليجرام <strong className="text-indigo-300">(#{linkedChatId})</strong>
+                                </>
+                              )}
+                            </p>
                           </div>
-                          <p className="text-xs text-slate-400">جاري الرفع المباشر إلى مجلد "{selectedFolderName}"...</p>
-                        </div>
-                      ) : (
-                        <div className="space-y-2">
-                          <UploadCloud className="w-10 h-10 text-indigo-400 mx-auto" />
-                          <p className="text-sm font-bold text-white">اضغط هنا لاختيار أي ملف ضخم من جهازك</p>
-                          <p className="text-xs text-slate-400">
-                            سيتم حفظه في مجلد: <strong className="text-emerald-300">{selectedFolderName}</strong>
-                          </p>
+                        )}
+                      </label>
+
+                      {uploadingLocal && (
+                        <div className="flex justify-center">
+                          <button
+                            type="button"
+                            onClick={handleCancelLocalUpload}
+                            className="px-4 py-2 rounded-xl bg-rose-600/20 hover:bg-rose-600/30 border border-rose-500/40 text-rose-300 text-xs font-bold cursor-pointer"
+                          >
+                            إلغاء الرفع الجاري
+                          </button>
                         </div>
                       )}
-                    </label>
+                    </div>
                   )}
                 </div>
               )}
@@ -3451,7 +3977,7 @@ export default function App() {
                           الحل الأول (فوري في ثانيتين بدون إعدادات Google Cloud):
                         </p>
                         <p className="text-slate-300">
-                          من تبويب البرنامج هنا في AI Studio اضغط <strong>"نسخ كود تفعيل الجلسة السريع لـ Vercel"</strong> أو أدخل رابط موقعك على Vercel واضغط <strong>"ربط موقع Vercel بحسابي الآن"</strong>، أو الصق الكود في الخانة أدناه!
+                          استخدم قسم <strong>"الربط الدائم 24/7 (Refresh Token)"</strong> بالأسفل لربط أي حساب Google Drive مباشرة وبدون انتهاء صلاحية!
                         </p>
                       </div>
                       <div className="p-3 rounded-lg bg-slate-950/90 border border-amber-500/30 space-y-2.5">
@@ -3523,13 +4049,118 @@ export default function App() {
                     </div>
                   )}
 
+                  {/* PERMANENT 24/7 REFRESH TOKEN & 403 ACCESS_DENIED SOLUTION FOR MULTI-USER */}
+                  <div className="p-4 rounded-xl bg-emerald-950/30 border border-emerald-500/40 space-y-3 text-xs">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <p className="text-sm font-bold text-emerald-300 flex items-center gap-1.5">
+                          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                          <span>
+                            الربط الدائم المستمر 24/7 لجميع المستخدمين (وحل خطأ 403: access_denied وانتهاء الجلسة)
+                          </span>
+                        </p>
+                        <p className="text-[11px] text-slate-300 mt-0.5 leading-relaxed">
+                          يضمن استمرار اتصال Google Drive تلقائياً مدى الحياة بدون انتهاء صلاحية الجلسة، ويتيح لأي مستخدم ربط حسابه فوراً حتى لو ظهر خطأ <code>403: access_denied</code>.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setShowOAuth403Guide((v) => !v)}
+                        className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-emerald-500/40 text-emerald-300 font-semibold cursor-pointer shrink-0"
+                      >
+                        {showOAuth403Guide ? 'إخفاء خطوات الحل' : 'عرض خطوات الحصول على الرمز الدائم'}
+                      </button>
+                    </div>
+
+                    {showOAuth403Guide && (
+                      <div className="p-3.5 rounded-xl bg-slate-950/90 border border-slate-800 space-y-3 text-xs leading-relaxed">
+                        <div className="space-y-1.5">
+                          <p className="font-bold text-amber-300">
+                            أولاً: كيف تلغي رسالة (خطأ 403: access_denied — لم يكمل التطبيق عملية التحقق) لجميع المستخدمين نهائياً؟
+                          </p>
+                          <p className="text-slate-300">
+                            تظهر هذه الرسالة لأن مشروع Google Cloud في وضع <strong>Testing (الاختبار)</strong>. لفتحه لأي حساب جيميل بضغطة واحدة:
+                          </p>
+                          <a
+                            href={`https://console.cloud.google.com/apis/credentials/consent?project=${(firebaseConfig as any).projectId}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200 font-bold"
+                          >
+                            <span>فتح شاشة موافقة Google Cloud والضغط على PUBLISH APP (نشر التطبيق)</span>
+                            <ExternalLink className="w-3.5 h-3.5" />
+                          </a>
+                        </div>
+
+                        <div className="pt-2 border-t border-slate-800 space-y-1.5">
+                          <p className="font-bold text-emerald-300">
+                            ثانياً: كيف يحصل أي مستخدم على رمز ربط دائم (Refresh Token 24/7) في 15 ثانية بدون خطأ 403؟
+                          </p>
+                          <ol className="list-decimal list-inside space-y-1 text-slate-300">
+                            <li>
+                              اضغط على الزر الأخضر بالأسفل لفتح <strong>Google OAuth Playground</strong> (مُعدّ مسبقاً بصلاحيات Drive).
+                            </li>
+                            <li>
+                              اضغط الزر الأزرق <strong>Authorize APIs</strong> واختر حسابك في جوجل.
+                            </li>
+                            <li>
+                              اضغط <strong>Exchange authorization code for tokens</strong> ثم انسخ <code>Refresh token</code> (الذي يبدأ بـ <code>1//04...</code>) والصقه بالأسفل!
+                            </li>
+                          </ol>
+                          <a
+                            href={OAUTH_PLAYGROUND_PRECONFIGURED_URL}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold"
+                          >
+                            <span>1. فتح Google OAuth Playground لاستخراج رمز الربط الدائم (1//04...)</span>
+                            <ExternalLink className="w-3.5 h-3.5" />
+                          </a>
+                        </div>
+                      </div>
+                    )}
+
+                    <form onSubmit={(e) => handleConnectDirectDriveToken(e)} className="flex flex-col sm:flex-row gap-2">
+                      <input
+                        type="text"
+                        dir="ltr"
+                        value={directTokenInput}
+                        onChange={(e) => setDirectTokenInput(e.target.value)}
+                        placeholder="الصق هنا Refresh Token الدائم (1//04...) أو Access Token (ya29...) أو كود TD1_..."
+                        className="flex-1 px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-xs text-white placeholder-slate-500 font-mono"
+                      />
+                      <button
+                        type="submit"
+                        disabled={connectingDirectToken || !directTokenInput.trim()}
+                        className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer shrink-0"
+                      >
+                        {connectingDirectToken ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Check className="w-3.5 h-3.5" />
+                        )}
+                        <span>تفعيل الربط الدائم 24/7</span>
+                      </button>
+                    </form>
+                  </div>
+
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     {/* Google Drive Account Box */}
                     <div className="p-4 rounded-xl bg-slate-900/70 border border-slate-800 space-y-3">
-                      <div className="flex items-center justify-between">
+                      <div className="flex items-center justify-between gap-2">
                         <span className="text-xs font-bold text-white">حساب Google Drive الشخصي</span>
-                        <span className={`text-xs font-semibold ${driveConnected ? 'text-emerald-400' : 'text-amber-400'}`}>
-                          {driveConnected ? 'متصل' : 'غير مربوط'}
+                        <span
+                          className={`text-xs font-semibold ${
+                            driveConnected ? 'text-emerald-400' : 'text-amber-400'
+                          }`}
+                        >
+                          {driveConnected
+                            ? driveHasRefreshToken
+                              ? 'متصل (ربط دائم 24/7)'
+                              : 'متصل (جلسة نشطة)'
+                            : driveTokenExpired
+                            ? 'انتهت الجلسة المؤقتة'
+                            : 'غير مربوط'}
                         </span>
                       </div>
                       <p className="text-xs text-slate-400 font-mono truncate">
@@ -3540,8 +4171,18 @@ export default function App() {
                           onClick={handleSignIn}
                           className="px-3.5 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold transition cursor-pointer"
                         >
-                          {driveConnected ? 'تبديل حساب Google' : 'ربط حساب Google Drive'}
+                          {driveConnected ? 'تبديل / تجديد حساب Google' : 'تسجيل الدخول بـ Google'}
                         </button>
+                        <a
+                          href={OAUTH_PLAYGROUND_PRECONFIGURED_URL}
+                          target="_blank"
+                          rel="noreferrer"
+                          onClick={() => setShowOAuth403Guide(true)}
+                          className="px-3 py-2 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/40 text-emerald-300 text-xs font-semibold transition inline-flex items-center gap-1"
+                        >
+                          <span>ربط دائم بدون 403</span>
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
                         {driveConnected && (
                           <>
                             <button
@@ -3563,32 +4204,6 @@ export default function App() {
                             </button>
                           </>
                         )}
-                      </div>
-
-                      {/* Quick Session Code Paste Box for Instant Vercel Linking */}
-                      <div className="pt-2 border-t border-slate-800/80 space-y-2">
-                        <label className="block text-[11px] font-semibold text-slate-300">
-                          ربط فوري على Vercel بكود الجلسة (يتجاوز خطأ origin_mismatch بدون إعدادات):
-                        </label>
-                        <div className="flex items-center gap-1.5">
-                          <input
-                            type="text"
-                            dir="ltr"
-                            value={sessionCodeInput}
-                            onChange={(e) => setSessionCodeInput(e.target.value)}
-                            placeholder="الصق كود الجلسة TD1_... هنا"
-                            className="flex-1 px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-white placeholder-slate-500"
-                          />
-                          <button
-                            type="button"
-                            disabled={applyingSessionCode || !sessionCodeInput.trim()}
-                            onClick={() => applyPortableSessionCode(sessionCodeInput)}
-                            className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-bold cursor-pointer shrink-0 flex items-center gap-1"
-                          >
-                            {applyingSessionCode ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
-                            <span>تفعيل</span>
-                          </button>
-                        </div>
                       </div>
                     </div>
 
@@ -3620,7 +4235,7 @@ export default function App() {
                       )}
 
                       <div className="flex flex-wrap gap-2 pt-1">
-                        {botUsername && (
+                        {botUsername ? (
                           <a
                             href={telegramDeepLink}
                             target="_blank"
@@ -3628,8 +4243,17 @@ export default function App() {
                             className="px-3.5 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold transition inline-flex items-center gap-1.5"
                           >
                             <Bot className="w-3.5 h-3.5" />
-                            <span>فتح البوت وربط تليجرام</span>
+                            <span>فتح البوت (@{botUsername}) وربط تليجرام</span>
                           </a>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => setActiveModal('admin')}
+                            className="px-3.5 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold transition inline-flex items-center gap-1.5 cursor-pointer"
+                          >
+                            <Bot className="w-3.5 h-3.5" />
+                            <span>إدخال توكن البوت لتفعيل الربط</span>
+                          </button>
                         )}
                         {linkedChatId && (
                           <button
@@ -3649,21 +4273,21 @@ export default function App() {
 
                   {/* 1-Click Vercel Remote Sync Bridge (When Drive is Connected here) */}
                   {driveConnected && (
-                    <div className="p-4 rounded-xl bg-emerald-950/30 border border-emerald-500/30 space-y-3">
+                    <div className="p-4 rounded-xl bg-sky-950/30 border border-sky-500/30 space-y-3">
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <div>
-                          <p className="text-xs font-bold text-emerald-300 flex items-center gap-1.5">
-                            <Globe className="w-4 h-4 text-emerald-400" />
-                            <span>ربط وتفعيل موقعك على Vercel بحسابك الحالي بضغطة واحدة</span>
+                          <p className="text-xs font-bold text-sky-300 flex items-center gap-1.5">
+                            <Globe className="w-4 h-4 text-sky-400" />
+                            <span>نقل الجلسة إلى موقع خارجي على Vercel بضغطة واحدة</span>
                           </p>
                           <p className="text-[11px] text-slate-400 mt-0.5">
-                            انقل جلسة Google Drive ({effectiveUserEmail}) إلى موقعك على Vercel مباشرة بدون الحاجة لإعدادات Google Cloud:
+                            انقل جلسة Google Drive ({effectiveUserEmail}) إلى موقعك على Vercel مباشرة:
                           </p>
                         </div>
                         <button
                           type="button"
                           onClick={handleCopyPortableSessionCode}
-                          className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-emerald-500/40 text-emerald-300 text-xs font-semibold flex items-center gap-1.5 cursor-pointer shrink-0"
+                          className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-sky-500/40 text-sky-300 text-xs font-semibold flex items-center gap-1.5 cursor-pointer shrink-0"
                         >
                           {copiedSessionCode ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                           <span>{copiedSessionCode ? 'تم نسخ الكود!' : 'نسخ كود تفعيل الجلسة'}</span>
@@ -3682,7 +4306,7 @@ export default function App() {
                         <button
                           type="submit"
                           disabled={pushingToVercel}
-                          className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer shrink-0"
+                          className="px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-white text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer shrink-0"
                         >
                           {pushingToVercel ? (
                             <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -3785,23 +4409,112 @@ export default function App() {
                         className="px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-rose-950/40 text-slate-400 hover:text-rose-300 border border-slate-800 text-xs transition flex items-center gap-1.5 cursor-pointer"
                       >
                         <LogOut className="w-3.5 h-3.5" />
-                        <span>الخروج من الجلسة على هذا المتصفح</span>
+                        <span>الخروج من الجلسة على هذا المتصفح (لتسجيل مستخدم آخر)</span>
                       </button>
                     </div>
                   )}
                 </div>
               )}
 
-              {/* MODAL 5: OWNER ADMIN & VERCEL DEPLOYMENT */}
+              {/* MODAL 5: OWNER ADMIN, BOT TOKEN SETUP & VERCEL DEPLOYMENT */}
               {activeModal === 'admin' && (
                 <div className="space-y-5">
+                  {/* Direct In-App Telegram Bot Token & MTProto 2GB Configuration Card */}
+                  <div className="p-4 rounded-xl bg-indigo-950/40 border border-indigo-500/40 space-y-3.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <h3 className="text-xs sm:text-sm font-bold text-white flex items-center gap-1.5">
+                          <Bot className="w-4 h-4 text-indigo-400" />
+                          <span>إدخال وتفعيل توكن بوت تليجرام (TELEGRAM_BOT_TOKEN) ومحرك 2GB</span>
+                        </h3>
+                        <p className="text-[11px] text-slate-300 mt-0.5">
+                          أدخل توكن البوت من <code>@BotFather</code> هنا مباشرة لتفعيل البوت أو تغييره في أي وقت بدون تعديل ملفات البيئة.
+                        </p>
+                      </div>
+                      {serverStatus?.bot.maskedToken && (
+                        <span className="px-2.5 py-1 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-[11px] font-mono" dir="ltr">
+                          Active: {serverStatus.bot.maskedToken}
+                        </span>
+                      )}
+                    </div>
+
+                    <form onSubmit={handleSaveBotConfig} className="space-y-3">
+                      <div className="space-y-1">
+                        <label className="block text-xs font-semibold text-slate-200">
+                          توكن بوت تليجرام (Bot Token من @BotFather)
+                        </label>
+                        <input
+                          type="text"
+                          dir="ltr"
+                          value={botTokenInput}
+                          onChange={(e) => setBotTokenInput(e.target.value)}
+                          placeholder={
+                            serverStatus?.bot.maskedToken
+                              ? `التوكن الحالي محفوظ (${serverStatus.bot.maskedToken}) — الصق توكن جديد هنا لتغييره`
+                              : '123456789:ABCdefGHIjklMNOpqrsTUVwxyz'
+                          }
+                          className="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-xs text-white placeholder-slate-500 font-mono"
+                        />
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                        <div className="space-y-1">
+                          <label className="block text-[11px] font-semibold text-slate-300">
+                            TELEGRAM_API_ID (اختياري لمحرك 2GB MTProto — مدمج تلقائياً)
+                          </label>
+                          <input
+                            type="text"
+                            dir="ltr"
+                            value={botApiIdInput}
+                            onChange={(e) => setBotApiIdInput(e.target.value)}
+                            placeholder="اتركه فارغاً لاستخدام المحرك المدمج (2040)"
+                            className="w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-white placeholder-slate-500 font-mono"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="block text-[11px] font-semibold text-slate-300">
+                            TELEGRAM_API_HASH (اختياري لمحرك 2GB MTProto)
+                          </label>
+                          <input
+                            type="password"
+                            dir="ltr"
+                            value={botApiHashInput}
+                            onChange={(e) => setBotApiHashInput(e.target.value)}
+                            placeholder="اتركه فارغاً لاستخدام المحرك المدمج"
+                            className="w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-white placeholder-slate-500 font-mono"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                        <span className="text-[11px] text-slate-400">
+                          {botConnected && botUsername
+                            ? `✅ البوت المتصل حالياً: @${botUsername} (${serverStatus?.bot.info?.first_name})`
+                            : serverStatus?.bot.error || 'البوت بانتظار إدخال التوكن'}
+                        </span>
+                        <button
+                          type="submit"
+                          disabled={savingBotConfig}
+                          className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                        >
+                          {savingBotConfig ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <Check className="w-3.5 h-3.5" />
+                          )}
+                          <span>حفظ وتفعيل إعدادات البوت</span>
+                        </button>
+                      </div>
+                    </form>
+                  </div>
+
                   <div className="flex flex-wrap items-center justify-between gap-3 p-4 rounded-xl bg-slate-900/60 border border-slate-800">
                     <div className="space-y-0.5">
                       <p className="text-xs font-bold text-white">
-                        حالة البوت: {botConnected ? 'متصل ويعمل' : 'غير متصل'} · محرك MTProto 2GB: {mtprotoConnected ? 'مفعل' : 'قياسي'}
+                        حالة البوت: {botConnected ? 'متصل ويعمل' : 'غير متصل'} · محرك MTProto 2GB: {mtprotoConnected ? 'مفعل (يدعم حتى 2GB)' : 'قياسي'}
                       </p>
                       <p className="text-[11px] text-slate-400">
-                        وضع الوصول الحالي: {serverStatus?.admin?.accessMode === 'owner_only' ? 'خاص بالمالك فقط' : 'عام لجميع المستخدمين'}
+                        وضع الوصول الحالي: {serverStatus?.admin?.accessMode === 'owner_only' ? 'خاص بالمالك فقط' : 'عام لجميع المستخدمين (كل مستخدم بحسابه المستقل)'}
                       </p>
                     </div>
 
@@ -3873,7 +4586,7 @@ export default function App() {
                   {/* Connected Users List */}
                   <div className="space-y-2">
                     <h4 className="text-xs font-bold text-slate-300">
-                      المستخدمون المتصلون ({serverStatus?.admin?.knownUsers?.length || 0})
+                      المستخدمون المتصلون ({serverStatus?.admin?.knownUsers?.length || 0}) · الحسابات المربوطة بـ Drive ({serverStatus?.admin?.connectedProfilesCount || 0})
                     </h4>
                     {!serverStatus?.admin?.knownUsers || serverStatus.admin.knownUsers.length === 0 ? (
                       <p className="text-xs text-slate-500">لا يوجد مستخدمون مسجلون بعد.</p>
@@ -3888,8 +4601,8 @@ export default function App() {
                               <p className="text-xs font-bold text-white truncate">
                                 {u.name} {u.username ? `(@${u.username})` : ''}
                               </p>
-                              <p className="text-[11px] text-slate-400 font-mono tabular-nums">
-                                #{u.chatId} · {u.transfersCount} عملية
+                              <p className="text-[11px] text-slate-400 font-mono tabular-nums truncate">
+                                #{u.chatId} · {u.transfersCount} عملية {u.linkedEmail ? `· ${u.linkedEmail}` : ''}
                               </p>
                             </div>
                             {u.chatId !== serverStatus.admin?.ownerChatId && (
